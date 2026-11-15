@@ -1,17 +1,61 @@
 {
   "name": "three-nanite",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "2.0.0-alpha.0",
+  "description": "Nanite-style cluster LOD (meshlet DAG) for three.js. Works with WebGLRenderer and WebGPURenderer.",
   "license": "MIT",
-  "scripts": {
-    "dev": "esbuild src/index.ts --bundle --loader:.glsl=text --loader:.ply=file --loader:.obj=file --outfile=dist/three-nanite.js --target=es2020 --format=esm --watch"
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
   },
-  "devDependencies": {
-    "esbuild": "^0.15.7",
-    "typescript": "^4.8.3"
+  "keywords": [
+    "three",
+    "threejs",
+    "nanite",
+    "meshlet",
+    "lod",
+    "webgpu",
+    "webgl"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./build": {
+      "types": "./dist/build/index.d.ts",
+      "default": "./dist/build/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "vite demo",
+    "demo:build": "vite build demo",
+    "demo:preview": "vite preview demo"
+  },
+  "peerDependencies": {
+    "three": ">=0.170.0"
   },
   "dependencies": {
-    "@types/three": "^0.163.0",
-    "three": "^0.163.0"
+    "meshoptimizer": "^1.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/three": "^0.187.0",
+    "lil-gui": "^0.21.0",
+    "three": "^0.187.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.0.0",
+    "vitest": "^4.1.12"
   }
 }

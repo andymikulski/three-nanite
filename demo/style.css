@@ -1,0 +1,59 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #9ec3e6;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+canvas {
+  display: block;
+}
+
+#hud,
+#overlay,
+#drop-hint {
+  position: fixed;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: rgba(10, 16, 24, 0.72);
+  color: #dbe7f3;
+  font-size: 12px;
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+#hud {
+  top: 8px;
+  left: 8px;
+  min-width: 270px;
+}
+
+#overlay {
+  bottom: 8px;
+  left: 8px;
+  max-width: 60vw;
+  white-space: pre-wrap;
+}
+
+#overlay.error {
+  background: rgba(120, 16, 16, 0.9);
+  color: #fff;
+}
+
+#overlay:empty {
+  display: none;
+}
+
+#drop-hint {
+  right: 8px;
+  bottom: 8px;
+  opacity: 0.8;
+}
+
+body.dragging #drop-hint {
+  background: #2d7dd2;
+  opacity: 1;
+}
