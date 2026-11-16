@@ -13,8 +13,9 @@
  *    with its outer boundary locked, and the result is split into new,
  *    coarser clusters. Those new clusters record the group they came from in
  *    `clusterRefined`. Repeating this yields a DAG.
- *  - Simplification never creates vertices, so EVERY cluster of EVERY level
- *    indexes the one shared vertex buffer.
+ *  - Simplification never creates vertices (border dilation, a build option,
+ *    appends some to the input's), so EVERY cluster of EVERY level indexes the
+ *    one shared vertex buffer.
  *  - Each group stores the sphere + error of its simplified form. Errors and
  *    spheres are monotonic up the DAG, which is what makes any cut crack-free.
  *

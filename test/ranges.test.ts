@@ -78,7 +78,8 @@ describe("draw ranges", () => {
 describe("MeshletMesh with merged clusters (the default)", () => {
   it("registers one geometry per draw range and draws the fine level in one slot", () => {
     const data = makeFixture();
-    const mesh = new MeshletMesh(data, new MeshBasicMaterial());
+    // drawn by cluster: whole-mesh levels (the default for a mesh this small) are tested on their own
+    const mesh = new MeshletMesh(data, new MeshBasicMaterial(), { instancedLevels: false });
     expect(mesh.ranges.count).toBe(2);
     const sphere = new Sphere();
     for (let r = 0; r < mesh.ranges.count; r++) {

@@ -52,6 +52,11 @@ describe("MeshletMesh construction", () => {
     const data = makeFixture();
     const mesh = new MeshletMesh(data, new MeshBasicMaterial(), { mergeClusters: false });
     expect(mesh.isMeshletMesh).toBe(true);
+    // the draw mesh is in the scene only while it draws something
+    expect(mesh.batched.parent).toBeNull();
+    expect(mesh.children).not.toContain(mesh.batched);
+    mesh.update(makeCamera(5), H);
+    expect(mesh.batched.parent).toBe(mesh);
     expect(mesh.children).toContain(mesh.batched);
     const sphere = new Sphere();
     for (let c = 0; c < data.clusterCount; c++) {
@@ -363,13 +368,12 @@ describe("MeshletMesh instances", () => {
     const camera = makeCamera(5);
     const scene = new Scene();
 
-    // growth happens inside the shadow pass hook ...
-    const light = new OrthographicCamera(-5, 5, 5, -5, 0.1, 100);
-    first.onBeforeShadow(renderer, scene, camera, light, first.geometry, first.material, null as never);
+    // growth happens in an update ...
+    mesh.update(camera);
     expect(mesh.batched).not.toBe(first);
     const clusters = mesh.stats.clusters;
 
-    // ... and the main pass of the same frame still draws the old mesh: it must stay intact and inert
+    // ... and a render that is under way may still draw the old mesh: it must stay intact and inert
     expect(() => first.onBeforeRender(renderer, scene, camera, first.geometry, first.material, null as never)).not.toThrow();
     expect(first.geometry.getAttribute("position")).toBeDefined();
     expect(mesh.stats.clusters).toBe(clusters);
@@ -382,7 +386,7 @@ describe("MeshletMesh instances", () => {
     expect(() => next.onBeforeRender(renderer, scene, camera, next.geometry, next.material, null as never)).not.toThrow();
   });
 
-  it("never takes LOD from a light camera (WebGPURenderer hook order)", () => {
+  it("never takes LOD from a light camera", () => {
     const mesh = makeMesh();
     const batched = mesh.batched;
     const renderer = {
@@ -390,22 +394,37 @@ describe("MeshletMesh instances", () => {
       getDrawingBufferSize: (v: { set(x: number, y: number): unknown }) => v.set(1920, 1080),
     } as unknown as WebGLRenderer;
     const scene = new Scene();
+    scene.add(mesh);
     const viewer = makeCamera(5000); // far away: coarse
     // an orthographic light camera with a tiny frustum would select full detail if it were used
-    const light = new OrthographicCamera(-0.01, 0.01, 0.01, -0.01, 0.1, 100);
-    light.updateProjectionMatrix();
-    light.updateMatrixWorld(true);
+    const tinyLight = () => {
+      const light = new OrthographicCamera(-0.01, 0.01, 0.01, -0.01, 0.1, 100);
+      light.updateProjectionMatrix();
+      light.updateMatrixWorld(true);
+      return light;
+    };
 
-    batched.onBeforeRender(renderer, scene, viewer, batched.geometry, batched.material, null as never);
+    // what a renderer does: update(camera) while collecting the scene
+    expect(mesh.update(viewer)).toBe(true);
     expect(drawn(mesh)).toEqual([4]);
-    // WebGPURenderer: onBeforeShadow(camera === shadowCamera), then onBeforeRender(shadowCamera)
-    batched.onBeforeShadow(renderer, scene, light, light, batched.geometry, batched.material, null as never);
+
+    // WebGPURenderer renders a shadow map as a render of the scene with the light's camera and a
+    // shadow material as override: the update of that render is ignored, from the first one on
+    const light = tinyLight();
+    scene.overrideMaterial = Object.assign(new MeshBasicMaterial(), { isShadowPassMaterial: true });
+    expect(mesh.update(light)).toBe(false);
     expect(drawn(mesh)).toEqual([4]);
-    batched.onBeforeRender(renderer, scene, light, batched.geometry, batched.material, null as never);
+    scene.overrideMaterial = null;
+
+    // and a camera that a shadow hook named is a light's camera for good
+    const other = tinyLight();
+    batched.onBeforeShadow(renderer, scene, viewer, other, batched.geometry, batched.material, null as never);
+    batched.onBeforeRender(renderer, scene, other, batched.geometry, batched.material, null as never);
+    expect(mesh.update(other)).toBe(false);
     expect(drawn(mesh)).toEqual([4]);
-    // WebGLRenderer: onBeforeShadow(camera = viewer, shadowCamera) does update from the viewer
-    const near = makeCamera(5);
-    batched.onBeforeShadow(renderer, scene, near, light, batched.geometry, batched.material, null as never);
+
+    // the viewer still drives it
+    expect(mesh.update(makeCamera(5))).toBe(true);
     expect(drawn(mesh)).toEqual([0, 1, 2, 3]);
   });
 
@@ -544,20 +563,25 @@ describe("MeshletMesh automatic updates", () => {
   } as unknown as WebGLRenderer;
   const scene = new Scene();
 
-  const beforeRender = (mesh: MeshletMesh, camera: Camera) =>
-    mesh.batched.onBeforeRender(fakeRenderer, scene, camera, mesh.batched.geometry, mesh.batched.material, null as never);
+  /** What a renderer does with the mesh in a frame: `update(camera)` while collecting the scene, then the draw hooks. */
+  const render = (mesh: MeshletMesh, camera: Camera, renderer = fakeRenderer) => {
+    if (mesh.autoUpdate) mesh.update(camera);
+    mesh.batched.onBeforeRender(renderer, scene, camera, mesh.batched.geometry, mesh.batched.material, null as never);
+  };
 
-  it("updates from onBeforeRender and respects autoUpdate", () => {
+  it("is updated by the renderers the way a THREE.LOD is", () => {
     const mesh = makeMesh();
+    // both renderers call `update(camera)` on objects with `isLOD` and `autoUpdate` while they collect the scene
+    expect(mesh.isLOD).toBe(true);
     expect(mesh.autoUpdate).toBe(true);
-    beforeRender(mesh, makeCamera(5));
+    render(mesh, makeCamera(5));
     expect(mesh.stats.triangles).toBe(128);
-    beforeRender(mesh, makeCamera(500));
+    render(mesh, makeCamera(500));
     expect(mesh.stats.triangles).toBe(32);
 
     const off = makeMesh();
     off.autoUpdate = false;
-    beforeRender(off, makeCamera(5));
+    render(off, makeCamera(5));
     expect(off.stats.clusters).toBe(0);
     expect(off.stats.triangles).toBe(0);
   });
@@ -565,35 +589,58 @@ describe("MeshletMesh automatic updates", () => {
   it("uses lodCamera instead of the rendering camera", () => {
     const mesh = makeMesh();
     mesh.lodCamera = makeCamera(500);
-    beforeRender(mesh, makeCamera(5));
+    render(mesh, makeCamera(5));
     expect(mesh.stats.triangles).toBe(32);
     mesh.lodCamera = makeCamera(5);
-    beforeRender(mesh, makeCamera(500));
+    render(mesh, makeCamera(500));
     expect(mesh.stats.triangles).toBe(128);
+    // an explicit update is for the camera it is given
+    mesh.update(makeCamera(500), H);
+    expect(mesh.stats.triangles).toBe(32);
   });
 
-  it("takes LOD from the viewer camera in shadow passes and ignores shadow cameras in onBeforeRender", () => {
+  it("ignores the cameras of shadow passes", () => {
     const mesh = makeMesh();
     const viewer = makeCamera(500);
     const shadowCamera = makeCamera(5);
-    mesh.batched.onBeforeShadow(fakeRenderer, scene, viewer, shadowCamera, mesh.batched.geometry, new MeshBasicMaterial(), null as never);
+    render(mesh, viewer);
     expect(mesh.stats.triangles).toBe(32);
-    // WebGPURenderer calls onBeforeRender with the light camera: must not change the LOD
-    beforeRender(mesh, shadowCamera);
+    mesh.batched.onBeforeShadow(fakeRenderer, scene, viewer, shadowCamera, mesh.batched.geometry, new MeshBasicMaterial(), null as never);
+    // WebGPURenderer renders the shadow map with the light camera: must not change the LOD
+    render(mesh, shadowCamera);
     expect(mesh.stats.triangles).toBe(32);
     // the viewer camera still works
-    beforeRender(mesh, viewer);
+    render(mesh, viewer);
     expect(mesh.stats.triangles).toBe(32);
+    render(mesh, makeCamera(5));
+    expect(mesh.stats.triangles).toBe(128);
   });
 
-  it("uses the render target height when rendering to a target", () => {
+  it("takes the viewport height from what the camera last rendered to", () => {
     const mesh = makeMesh();
     const renderer = {
       getRenderTarget: () => ({ height: 100 }),
       getDrawingBufferSize: (v: { set(x: number, y: number): unknown }) => v.set(1920, 1080),
     } as unknown as WebGLRenderer;
-    // at z=30 a 1080px viewport refines (see the threshold test) but a 100px one does not
-    mesh.batched.onBeforeRender(renderer, scene, makeCamera(30), mesh.batched.geometry, mesh.batched.material, null as never);
+    const camera = makeCamera(30);
+    // the first frame has to assume a height (1080 outside a browser): at z=30 that refines
+    render(mesh, camera, renderer);
+    expect(mesh.stats.triangles).toBe(128);
+    // from then on the height is the one the camera rendered to: a 100px target does not refine
+    render(mesh, camera, renderer);
+    expect(mesh.stats.triangles).toBe(32);
+
+    // another camera, rendering to the canvas, keeps its own height
+    const main = makeCamera(30);
+    render(mesh, main);
+    render(mesh, main);
+    expect(mesh.stats.triangles).toBe(128);
+    render(mesh, camera, renderer);
+    expect(mesh.stats.triangles).toBe(32);
+
+    // viewportHeight overrides both
+    mesh.viewportHeight = 100;
+    render(mesh, main);
     expect(mesh.stats.triangles).toBe(32);
   });
 

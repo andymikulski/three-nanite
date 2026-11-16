@@ -26,4 +26,12 @@ export {
 // low level: LOD selection without three.js objects
 export { ClusterSelector, countTriangles, lodScale } from "./core/select.js";
 export { computeDrawRanges, rangesOfCut, type DrawRanges } from "./core/ranges.js";
+export {
+  computeLodLevels,
+  copyLevelIndices,
+  levelForError,
+  levelOfCut,
+  type LodLevelOptions,
+  type LodLevels,
+} from "./core/levels.js";
 export { validateMeshletData } from "./core/validate.js";

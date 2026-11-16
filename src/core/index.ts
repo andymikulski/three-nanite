@@ -9,6 +9,14 @@ export type { MeshletAttribute, MeshletData, MeshletInput, TypedArray } from "..
 export { ClusterSelector, countTriangles, getLodErrors, lodScale } from "./select.js";
 export { computeDrawRanges, rangesOfCut, type DrawRanges } from "./ranges.js";
 export {
+  computeLodLevels,
+  copyLevelIndices,
+  levelForError,
+  levelOfCut,
+  type LodLevelOptions,
+  type LodLevels,
+} from "./levels.js";
+export {
   deserializeMeshlets,
   MESHLET_FILE_EXTENSION,
   serializeMeshlets,

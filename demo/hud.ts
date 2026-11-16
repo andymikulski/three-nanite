@@ -10,6 +10,12 @@ export interface HudInfo {
   /** Triangles drawn by the LOD selection (or by the reference mesh in comparison mode). */
   triangles: number;
   fullTriangles: number;
+  /** Draws a pass takes: cluster ranges of the instances drawn by cluster, plus one per level in use. */
+  draws: number;
+  /** Instances drawn through an instanced whole-mesh level, how many of them are in view, and the levels in use. */
+  levelInstances: number;
+  levelVisible: number;
+  levelDraws: number;
   slots: number;
   drawCapacity: number;
   updateMs: number;
@@ -29,7 +35,9 @@ export function renderHud(i: HudInfo): void {
     `triangles    ${fmt(i.triangles)}`,
     `full detail  ${fmt(i.fullTriangles)}`,
     `saved        ${i.comparing ? "(full detail shown)" : `${saved.toFixed(1)} %`}`,
-    `slots        ${fmt(i.slots)} / ${fmt(i.drawCapacity)}`,
+    `draws        ${fmt(i.draws)}`,
+    `by level     ${fmt(i.levelInstances)} on ${fmt(i.levelDraws)} levels (${fmt(i.levelVisible)} in view)`,
+    `by cluster   ${fmt(i.instances - i.levelInstances)} (${fmt(i.slots)} / ${fmt(i.drawCapacity)} slots)`,
     `LOD update   ${i.updateMs.toFixed(2)} ms`,
     `draw calls   ${fmt(i.drawCalls)}`,
   ].join("\n");

@@ -6,7 +6,7 @@ import type { MeshletData } from "../types.js";
  *
  * A group's simplified form is "over budget" (must be refined) when
  *
- *     perspective:   groupError > k * max(distance - radius, znear)
+ *     perspective:   groupError > k * max(distance - radius, distance to the mesh sphere, znear)
  *     orthographic:  groupError > k
  *
  * @param errorThresholdPx  Allowed geometric error, in pixels.
@@ -41,6 +41,15 @@ export function lodScale(
 export class ClusterSelector {
   readonly data: MeshletData;
 
+  /**
+   * After a `select`: the smallest error among the groups found over budget (`Infinity` if none)
+   * and the largest among those found within budget (0 if none). When `lastWithin < lastOver` the
+   * cut is exactly the view-independent cut of any error in `[lastWithin, lastOver)`: the whole
+   * mesh at one level of detail (see `LodLevels`).
+   */
+  lastOver = Infinity;
+  lastWithin = 0;
+
   /** Per group: `gen` => visited & not over, `gen + 1` => visited & over. */
   private readonly state: Uint32Array;
   private readonly stack: Uint32Array;
@@ -54,6 +63,12 @@ export class ClusterSelector {
 
   /**
    * View-dependent selection.
+   *
+   * The distance to a group is never taken smaller than the distance to the bounding sphere of
+   * the mesh. Group spheres only grow up the DAG (each encloses the spheres below it) and end up
+   * well outside the mesh, which would otherwise refine a mesh seen from outside as if the camera
+   * were much nearer. All geometry is inside the mesh sphere, so the bound stays valid, and
+   * clamping every group by the same value keeps the decisions monotonic (crack-free).
    *
    * @param out   Receives cluster ids. Must hold at least `data.clusterCount` entries.
    * @param px,py,pz  Camera position in MESH space (ignored when `orthographic`).
@@ -94,6 +109,19 @@ export class ClusterSelector {
       stack[sp++] = g;
     }
 
+    // no group is nearer than the mesh itself
+    let floor = znear;
+    if (!orthographic) {
+      const s = d.boundingSphere;
+      const dx = s[0] - px;
+      const dy = s[1] - py;
+      const dz = s[2] - pz;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) - s[3];
+      if (dist > floor) floor = dist;
+    }
+
+    let minOver = Infinity;
+    let maxWithin = 0;
     let n = 0;
     while (sp > 0) {
       const g = stack[--sp];
@@ -119,11 +147,17 @@ export class ClusterSelector {
             const dy = groupBounds[o + 1] - py;
             const dz = groupBounds[o + 2] - pz;
             const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) - groupBounds[o + 3];
-            over = err > k * (dist > znear ? dist : znear);
+            over = err > k * (dist > floor ? dist : floor);
           }
-          s = over ? gen + 1 : gen;
+          if (over) {
+            s = gen + 1;
+            stack[sp++] = r;
+            if (err < minOver) minOver = err;
+          } else {
+            s = gen;
+            if (err > maxWithin) maxWithin = err;
+          }
           state[r] = s;
-          if (over) stack[sp++] = r;
         }
 
         // the finer group is within budget => this (coarser) cluster is the one to draw
@@ -131,6 +165,8 @@ export class ClusterSelector {
       }
     }
 
+    this.lastOver = minOver;
+    this.lastWithin = maxWithin;
     return n;
   }
 

@@ -174,7 +174,12 @@ export function unweldMeshlets(data: MeshletData, source: Uint32Array, original:
     throw new Error("unweldMeshlets: original.attributes[0] must be 'position' with itemSize 3");
   }
   if (source.length !== data.vertexCount) {
-    throw new Error(`unweldMeshlets: source has ${source.length} entries, the hierarchy has ${data.vertexCount} vertices`);
+    throw new Error(
+      `unweldMeshlets: source has ${source.length} entries, the hierarchy has ${data.vertexCount} vertices` +
+        (data.vertexCount > source.length
+          ? " (it was built with dilateBorders, which adds vertices: a hierarchy that is mapped back must be built without it)"
+          : ""),
+    );
   }
 
   const indices = new Uint32Array(data.indices.length);

@@ -69,7 +69,7 @@ describe("build -> serialize -> render pipeline", () => {
   });
 
   it("gives each instance its own level of detail and reports instance ids on raycast", () => {
-    const mesh = new MeshletMesh(data, new MeshBasicMaterial(), { maxInstances: 3 });
+    const mesh = new MeshletMesh(data, new MeshBasicMaterial(), { maxInstances: 3, drawCost: 0 });
     mesh.count = 3;
     const m = new Matrix4();
     mesh.setMatrixAt(0, m.makeTranslation(0, 0, 0));
@@ -82,13 +82,11 @@ describe("build -> serialize -> render pipeline", () => {
     camera.position.set(0, 0, 4);
     mesh.update(camera, 1080);
 
-    // per-instance triangle counts, recovered from the draw slots
-    const perInstance = [0, 0, 0];
-    const batched = mesh.batched;
-    for (let slot = 0; slot < batched.instanceCount; slot++) {
-      if (!batched.getVisibleAt(slot)) continue;
-      perInstance[mesh.slotInstance[slot]] += mesh.ranges.indexCount[batched.getGeometryIdAt(slot)] / 3;
-    }
+    const perInstance = [0, 1, 2].map((i) => mesh.getTriangleCountAt(i));
+    // the near one mixes levels (drawn by cluster), the far ones are each on one whole-mesh level
+    expect(mesh.getLevelAt(0)).toBe(-1);
+    expect(mesh.getLevelAt(1)).toBeGreaterThan(0);
+    expect(mesh.getLevelAt(2)).toBeGreaterThan(mesh.getLevelAt(1));
     expect(perInstance[0]).toBeGreaterThan(perInstance[1]);
     expect(perInstance[1]).toBeGreaterThan(perInstance[2]);
     expect(perInstance[0] + perInstance[1] + perInstance[2]).toBe(mesh.stats.triangles);
