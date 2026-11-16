@@ -12,6 +12,7 @@ import { buildMeshlets, type BuildMeshletsOptions } from "./buildMeshlets.js";
 
 export { buildMeshlets, type BuildMeshletsOptions } from "./buildMeshlets.js";
 export { partitionClusters } from "./partition.js";
+export { unweldMeshlets, weldVertices, type WeldResult } from "./weld.js";
 
 /** Options for {@link buildMeshletsFromGeometry}. */
 export interface BuildFromGeometryOptions extends BuildMeshletsOptions {

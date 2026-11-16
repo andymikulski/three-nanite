@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { MeshBasicMaterial } from "three";
+import { ClusterSelector } from "../src/core/select.js";
 import { MESHLET_FILE_EXTENSION, deserializeMeshlets, serializeMeshlets } from "../src/core/serialize.js";
+import { validateMeshletData } from "../src/core/validate.js";
+import { createLodGeometry } from "../src/three/geometry.js";
+import { MeshletMesh } from "../src/three/MeshletMesh.js";
 import type { MeshletData, TypedArray } from "../src/types.js";
 import { makeFixture } from "./helpers/fixture.js";
 
@@ -174,3 +179,119 @@ describe("serializeMeshlets / deserializeMeshlets", () => {
     expect(() => deserializeMeshlets(bytes)).toThrow(/^Corrupt meshlet file: /);
   });
 });
+
+function readHeader(buf: ArrayBuffer): { indexBytes?: number; sections: { name: string; type: string }[] } {
+  const headerLen = new DataView(buf).getUint32(8, true);
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 16, headerLen)));
+}
+
+function selectedClusters(data: MeshletData, maxError: number): number[] {
+  const out = new Uint32Array(data.clusterCount);
+  const n = new ClusterSelector(data).selectByError(out, maxError);
+  return Array.from(out.subarray(0, n)).sort((a, b) => a - b);
+}
+
+describe("hierarchy-only files", () => {
+  it("round-trips with { attributes: false }", () => {
+    const data = makeFixture();
+    const buf = serializeMeshlets(data, { attributes: false });
+    expect(readHeader(buf).sections.some((s) => "attribute" in s)).toBe(false);
+    expect(buf.byteLength).toBeLessThan(serializeMeshlets(data).byteLength);
+
+    const out = deserializeMeshlets(buf);
+    expect(out.attributes).toEqual([]);
+    expect(out.vertexCount).toBe(data.vertexCount);
+    for (const f of ARRAY_FIELDS) expectSameArray(out[f], data[f]);
+    expect(validateMeshletData(out)).toEqual([]);
+  });
+
+  it("still validates indices against vertexCount without attributes", () => {
+    const out = deserializeMeshlets(serializeMeshlets(makeFixture(), { attributes: false }));
+    out.vertexCount = 10;
+    expect(validateMeshletData(out).join("; ")).toMatch(/out of range/);
+  });
+
+  it("selects the same clusters as the original", () => {
+    const data = makeFixture();
+    const out = deserializeMeshlets(serializeMeshlets(data, { attributes: false }));
+    for (const error of [0, 0.01, 0.05, 1, Infinity]) {
+      expect(selectedClusters(out, error)).toEqual(selectedClusters(data, error));
+    }
+    expect(selectedClusters(out, 0)).toEqual([0, 1, 2, 3]);
+    expect(selectedClusters(out, Infinity)).toEqual([4]);
+  });
+
+  it("combines with compactIndices", () => {
+    const data = makeFixture();
+    const out = deserializeMeshlets(serializeMeshlets(data, { attributes: false, compactIndices: true }));
+    expect(out.attributes).toEqual([]);
+    expectSameArray(out.indices, data.indices);
+  });
+
+  it("cannot be rendered: MeshletMesh and createLodGeometry throw", () => {
+    const hierarchyOnly = deserializeMeshlets(serializeMeshlets(makeFixture(), { attributes: false }));
+    const message = "three-nanite: this MeshletData holds no vertex attributes (hierarchy only)";
+    expect(() => new MeshletMesh(hierarchyOnly, new MeshBasicMaterial())).toThrow(message);
+    expect(() => createLodGeometry(hierarchyOnly, 0)).toThrow(message);
+  });
+
+  it("rejects an attribute-less file whose first attribute is not a position", () => {
+    const data = makeFixture();
+    data.attributes.reverse();
+    expect(() => deserializeMeshlets(serializeMeshlets(data))).toThrow(/first attribute/);
+  });
+});
+
+describe("compact indices", () => {
+  it("stores 16-bit indices and widens them on load", () => {
+    const data = makeFixture();
+    const plain = serializeMeshlets(data);
+    const compact = serializeMeshlets(data, { compactIndices: true });
+
+    expect(readHeader(compact).indexBytes).toBe(2);
+    expect(readHeader(compact).sections.find((s) => s.name === "indices")?.type).toBe("u16");
+    expect(readHeader(plain).indexBytes).toBeUndefined();
+    expect(compact.byteLength).toBeLessThan(plain.byteLength);
+    expect(compact.byteLength % 8).toBe(0);
+
+    const out = deserializeMeshlets(compact);
+    expect(out.indices).toBeInstanceOf(Uint32Array);
+    expectSameData(out, data);
+    expect(validateMeshletData(out)).toEqual([]);
+  });
+
+  it("widens misaligned 16-bit sections too", () => {
+    const data = makeFixture();
+    const file = new Uint8Array(serializeMeshlets(data, { compactIndices: true }));
+    const host = new Uint8Array(file.length + 8);
+    host.set(file, 3);
+    expectSameData(deserializeMeshlets(host.subarray(3, 3 + file.length)), data);
+  });
+
+  it("stays 32-bit when vertexCount > 65536", () => {
+    const data = makeFixture();
+    data.vertexCount = 70000; // not a valid mesh, but serialization does not validate
+    const buf = serializeMeshlets(data, { compactIndices: true, attributes: false });
+    const header = readHeader(buf);
+    expect(header.indexBytes).toBeUndefined();
+    expect(header.sections.find((s) => s.name === "indices")?.type).toBe("u32");
+    expectSameArray(deserializeMeshlets(buf).indices, data.indices);
+  });
+
+  it("uses 16-bit up to exactly 65536 vertices", () => {
+    const data = makeFixture();
+    data.vertexCount = 65536;
+    expect(readHeader(serializeMeshlets(data, { compactIndices: true, attributes: false })).indexBytes).toBe(2);
+  });
+
+  it("rejects a header whose indexBytes disagrees with the section type", () => {
+    const buf = serializeMeshlets(makeFixture(), { compactIndices: true });
+    const bytes = new Uint8Array(buf);
+    const text = new TextDecoder().decode(bytes.subarray(16, 16 + new DataView(buf).getUint32(8, true)));
+    expect(text).toContain('"indexBytes":2');
+    const patched = new Uint8Array(buf.slice(0));
+    patched.set(new TextEncoder().encode(text.replace('"indexBytes":2', '"indexBytes":4')), 16);
+    expect(() => deserializeMeshlets(patched)).toThrow(/^Corrupt meshlet file: /);
+  });
+});
+

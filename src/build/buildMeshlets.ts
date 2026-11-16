@@ -42,6 +42,13 @@ export interface BuildMeshletsOptions {
   attributeWeights?: Record<string, number>;
   /** Attribute names whose seams get the meshopt "Protect" vertex bit. Default `["uv", "uv1", "uv2", "uv3"]`. */
   protectAttributes?: string[];
+  /**
+   * Per vertex, non-zero for a vertex that must be kept where it is at every level (a position is
+   * locked as a whole: locking one of its vertices locks all of them). Use it for the vertices a mesh
+   * shares with a neighbouring mesh that is simplified on its own, such as the edges of terrain tiles,
+   * so no crack opens between the two. Locked vertices limit how coarse the mesh can become.
+   */
+  lockedVertices?: ArrayLike<number>;
   /** Called once per DAG level. */
   onProgress?: (info: { level: number; clusterCount: number }) => void;
 }
@@ -154,6 +161,15 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
   const remap = MeshoptSimplifier.generatePositionRemap(positions, 3);
   const locks = new Uint8Array(vertexCount);
   setProtectBits(locks, remap, attributes, options.protectAttributes ?? ["uv", "uv1", "uv2", "uv3"]);
+  // user locks, per position (canonical vertex)
+  let pinned: Uint8Array | null = null;
+  if (options.lockedVertices) {
+    if (options.lockedVertices.length !== vertexCount) {
+      throw new Error("buildMeshlets: lockedVertices length does not match vertex count");
+    }
+    pinned = new Uint8Array(vertexCount);
+    for (let i = 0; i < vertexCount; i++) if (options.lockedVertices[i]) pinned[remap[i]] = LOCK;
+  }
   const simpAttrs = buildSimplifyAttributes(attributes, vertexCount, options.attributeWeights ?? { normal: 0.5 });
 
   // ---- LOD 0 ----------------------------------------------------------------
@@ -215,7 +231,7 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
     onProgress?.({ level: depth, clusterCount: clusters.length });
 
     const groupOffsets = partitionLevel(clusters, partitionSize, positions, remap, vertexCount);
-    lockBoundary(locks, clusters, groupOffsets, remap);
+    lockBoundary(locks, clusters, groupOffsets, remap, pinned);
 
     const pending: Cluster[] = [];
 
@@ -459,9 +475,16 @@ function partitionLevel(
 /**
  * Locks every vertex position that is shared with a different group, so group
  * boundaries are untouched by simplification. Bit 7 is scratch. The Protect
- * bit (seams) set up earlier is preserved.
+ * bit (seams) set up earlier is preserved. `pinned` holds the caller's own locks
+ * (per canonical vertex), which apply at every level.
  */
-function lockBoundary(locks: Uint8Array, clusters: Cluster[], groupOffsets: number[], remap: Uint32Array): void {
+function lockBoundary(
+  locks: Uint8Array,
+  clusters: Cluster[],
+  groupOffsets: number[],
+  remap: Uint32Array,
+  pinned: Uint8Array | null,
+): void {
   for (let i = 0; i < locks.length; i++) locks[i] &= ~(LOCK | SCRATCH);
 
   for (let g = 0; g + 1 < groupOffsets.length; g++) {
@@ -488,6 +511,7 @@ function lockBoundary(locks: Uint8Array, clusters: Cluster[], groupOffsets: numb
   for (let i = 0; i < locks.length; i++) {
     locks[i] = (locks[remap[i]] & LOCK) | (locks[i] & PROTECT);
   }
+  if (pinned) for (let i = 0; i < locks.length; i++) locks[i] |= pinned[remap[i]];
 }
 
 // ---------------------------------------------------------------------------------------------

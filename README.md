@@ -102,6 +102,28 @@ Things worth knowing:
 - **Cost of an update.** Flying a camera through 1,024 instances of that mesh costs about 0.9 ms of LOD selection per frame on a desktop CPU, 0.3 ms for 64 instances.
 - **Per-instance data** beyond matrix and color has no slot of its own. Custom shaders can read the per-draw id three exposes for batching; `InstancedBufferAttribute`s do not apply.
 
+#### `serializeMeshlets` options
+
+```ts
+serializeMeshlets(data, { attributes?, compactIndices? })
+```
+
+| Option | Default | |
+| --- | --- | --- |
+| `attributes` | `true` | With `false` the file holds the hierarchy only (clusters, groups, indices), without vertex data. It can drive a `ClusterSelector` but not a `MeshletMesh`; use it when the vertices live in your own buffers. |
+| `compactIndices` | `false` | Stores indices as 16 bit when the mesh has at most 65,536 vertices. `deserializeMeshlets` widens them to a `Uint32Array` again, so this only makes the file smaller. |
+
+### `three-nanite/core`
+
+The part of the library that imports neither three nor meshoptimizer: the data types, the file format, the LOD selection and validation. A runtime that draws by itself (your own renderer, or an engine other than three.js) should import this entry point rather than `three-nanite`.
+
+| Export | Purpose |
+| --- | --- |
+| `MeshletData`, `MeshletInput`, `MeshletAttribute`, `TypedArray` | The data types (also exported by the other entry points). |
+| `deserializeMeshlets(buffer)` / `serializeMeshlets(data, options?)` | `.meshlets` files, see above. `MESHLET_FILE_EXTENSION` is `".meshlets"`. |
+| `ClusterSelector`, `lodScale`, `countTriangles`, `getLodErrors` | LOD selection and error thresholds. |
+| `validateMeshletData(data)` | Consistency check; returns a list of problems. |
+
 ### `three-nanite/build`
 
 ```ts
@@ -117,9 +139,30 @@ The defaults follow meshoptimizer's `clodDefaultConfig(128)`. The options most l
 | `attributeWeights` | `{ normal: 0.5 }` | How strongly each attribute resists simplification. Add `color` or `uv` if they carry important detail. |
 | `protectAttributes` | `["uv", "uv1", "uv2", "uv3"]` | Attributes whose seams must be preserved. |
 | `attributes` | all | Which attributes to bake (`buildMeshletsFromGeometry` only). |
+| `lockedVertices` | none | One number per vertex; non-zero keeps that vertex, and every vertex at the same position, where it is at every level. For vertices shared with a neighbouring mesh that is simplified on its own, such as the borders of terrain tiles, so no crack opens between them. Locked vertices limit how coarse the mesh can become. |
+| `fallbackSloppy` | `true` | Use sloppy simplification when regular simplification gets stuck. It does not preserve attribute seams; turn it off when they matter. |
 | `onProgress` | | Called once per level. |
 
 The builder is deterministic and does not modify or copy the vertex arrays: the result references the arrays you passed in.
+
+#### Unindexed meshes: `weldVertices` and `unweldMeshlets`
+
+```ts
+weldVertices(input): { input: MeshletInput, source: Uint32Array }
+unweldMeshlets(data, source, original): MeshletData
+```
+
+Simplification needs shared vertices, but "triangle soup" buffers (three vertices per triangle, no index) are common in engines and exporters. `weldVertices` merges vertices whose attributes are all bitwise identical and returns an indexed mesh, plus `source`: for each welded vertex, the first vertex of the original it was made from. Build on the welded mesh, then `unweldMeshlets` rewrites the hierarchy's indices through `source`, so the result indexes the soup's own vertices and attributes again. Nothing else is copied.
+
+```ts
+import { buildMeshlets, unweldMeshlets, weldVertices } from "three-nanite/build";
+
+const { input, source } = weldVertices(soup);          // soup: MeshletInput without indices
+const welded = await buildMeshlets(input);
+const data = unweldMeshlets(welded, source, soup);     // same hierarchy, soup numbering
+```
+
+Because every attribute takes part in the comparison, vertices that differ in normal, uv or colour stay separate, and welding never changes what is drawn. Triangles that collapse while welding and vertices no triangle uses are dropped.
 
 ## Using it in a game
 
@@ -127,7 +170,32 @@ Three ways to adopt it, from least to most invasive. All of them start from the 
 
 1. **Discrete LODs from the DAG.** `createLodChain(data, { maxLevels: 4 })` returns ordinary geometries that share one set of vertex arrays. Drop them into `THREE.LOD` or your existing `InstancedMesh` switching. No new runtime behaviour, and already better than hand-authored LODs for dense meshes.
 2. **`MeshletMesh` per kind of object.** One `MeshletMesh` per model, one instance per placed copy, in place of an `InstancedMesh` plus an impostor. Near copies get full detail, far copies collapse to a few dozen triangles, and the transition has no pop to hide and no dither. It draws through `BatchedMesh`, so materials that patch shaders with `onBeforeCompile` must use three's batching chunks rather than `instanceMatrix`.
-3. **Custom drawing.** `ClusterSelector.select` gives you the list of cluster ids for a view; `data.clusterIndexStart/Count` tell you which index ranges to draw.
+3. **Custom drawing.** `ClusterSelector.select` gives you the list of cluster ids for a view; `data.clusterIndexStart/Count` tell you which index ranges to draw. Import it from `three-nanite/core`, which has no dependency on three or meshoptimizer.
+
+   This is the pattern for a game that already has its own merged, lightmapped vertex buffers: the vertex buffer stays exactly as it is, and only the index buffer is dynamic.
+
+   - **At bake time**, per object: weld the object's vertices with `weldVertices` by *all* attributes that are drawn, including the lightmap uv, so two vertices merge only if they draw identically. Build, then map back with `unweldMeshlets` so the hierarchy indexes the object's own vertices.
+   - Fragmented texture atlases are the hard case. With the default protected uv seams, simplification stops at roughly half the triangles on atlas-textured props. Build with `protectAttributes: []` and `attributeWeights: { normal: 0.5, uv: 1 }` instead: it goes much further, but a triangle that crosses a seam now counts as error, so the extra reduction only shows far away. Pick per asset.
+   - Pass `lockedVertices` for vertices shared between objects that are built separately, and `fallbackSloppy: false` when seams matter.
+   - Store hierarchy-only files: `serializeMeshlets(data, { attributes: false, compactIndices: true })`. The vertices are already in the game's buffers.
+   - **At run time**, per object: call `ClusterSelector.select` with the camera expressed in the object's own frame, and write the selected clusters' index ranges, plus the object's first-vertex offset, into a dynamic index buffer. Rewrite only when the cut changes.
+
+   ```ts
+   const k = lodScale(1, viewportHeight, camera.projectionMatrix.elements[5]);
+   local.copy(camera.position).applyMatrix4(object.inverseWorld);        // camera in object space
+   const n = selector.select(cut, local.x, local.y, local.z, k, camera.near / object.scale);
+   if (!sameCut(object, cut, n)) {
+     let w = object.indexStart;
+     for (let i = 0; i < n; i++) {
+       const c = cut[i], start = data.clusterIndexStart[c], count = data.clusterIndexCount[c];
+       for (let j = 0; j < count; j++) indexArray[w++] = data.indices[start + j] + object.firstVertex;
+     }
+     object.indexCount = w - object.indexStart;                           // draw range of this object
+     indexAttribute.needsUpdate = true;
+   }
+   ```
+
+   Skip alpha-cutout foliage and thin transparent decals: they are not connected surfaces and simplify poorly.
 
 Guidance on where it pays off:
 

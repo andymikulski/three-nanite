@@ -46,11 +46,11 @@ export function validateMeshletData(data: MeshletData): string[] {
   if (!Number.isInteger(clusterCount) || clusterCount <= 0) fail(`invalid clusterCount ${clusterCount}`);
   if (!Number.isInteger(groupCount) || groupCount <= 0) fail(`invalid groupCount ${groupCount}`);
 
-  // ---- attributes --------------------------------------------------------------
+  // ---- attributes (an empty list means hierarchy only) --------------------------------------------------------------
   const attrs = data.attributes;
-  if (!attrs || attrs.length === 0) {
+  if (!attrs) {
     fail("no attributes");
-  } else {
+  } else if (attrs.length > 0) {
     const p = attrs[0];
     if (p.name !== "position") fail(`attributes[0] is '${p.name}', expected 'position'`);
     if (!(p.array instanceof Float32Array)) fail("position attribute is not a Float32Array");

@@ -16,7 +16,12 @@ export {
 export { createLodChain, createLodGeometry, geometryToMeshletInput, getLodErrors } from "./three/geometry.js";
 
 // files
-export { deserializeMeshlets, MESHLET_FILE_EXTENSION, serializeMeshlets } from "./core/serialize.js";
+export {
+  deserializeMeshlets,
+  MESHLET_FILE_EXTENSION,
+  serializeMeshlets,
+  type SerializeOptions,
+} from "./core/serialize.js";
 
 // low level: LOD selection without three.js objects
 export { ClusterSelector, countTriangles, lodScale } from "./core/select.js";

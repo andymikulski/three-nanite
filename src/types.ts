@@ -55,7 +55,10 @@ export interface MeshletData {
   vertexCount: number;
   /**
    * Vertex attributes. `attributes[0]` is ALWAYS `position`
-   * (Float32Array, itemSize 3, not normalized).
+   * (Float32Array, itemSize 3, not normalized), except for hierarchy-only data
+   * (for example `deserializeMeshlets` of a file written with
+   * `attributes: false`), where the array is empty. Such data can drive
+   * `ClusterSelector` but not `MeshletMesh`.
    */
   attributes: MeshletAttribute[];
 

@@ -1,7 +1,9 @@
 import { Box3, BufferAttribute, BufferGeometry, Sphere, Vector3 } from "three";
 import type { InterleavedBufferAttribute } from "three";
-import { ClusterSelector } from "../core/select.js";
+import { ClusterSelector, getLodErrors } from "../core/select.js";
 import type { MeshletAttribute, MeshletData, MeshletInput, TypedArray } from "../types.js";
+
+export { getLodErrors };
 
 /** Array types three.js may hand us; wider than {@link TypedArray}. */
 type ThreeArray = TypedArray | Uint8ClampedArray | Float64Array;
@@ -184,9 +186,16 @@ export function createLodGeometry(
   maxError: number,
   options: { compact?: boolean } = {},
 ): BufferGeometry {
+  assertHasAttributes(data);
   const clusters = new Uint32Array(data.clusterCount);
   const n = new ClusterSelector(data).selectByError(clusters, Math.fround(maxError)); // errors are stored as float32
   return buildGeometry(data, clusters.subarray(0, n), options.compact === true);
+}
+
+function assertHasAttributes(data: MeshletData): void {
+  if (data.attributes.length === 0) {
+    throw new Error("three-nanite: this MeshletData holds no vertex attributes (hierarchy only)");
+  }
 }
 
 function buildGeometry(data: MeshletData, selected: Uint32Array, compact: boolean): BufferGeometry {
@@ -241,30 +250,6 @@ function buildGeometry(data: MeshletData, selected: Uint32Array, compact: boolea
   const b = data.boundingBox;
   geometry.boundingBox = new Box3(new Vector3(b[0], b[1], b[2]), new Vector3(b[3], b[4], b[5]));
   return geometry;
-}
-
-/**
- * Suggested error thresholds for {@link createLodGeometry}, one per DAG
- * level, coarsest last: for each depth the largest finite `groupError` among
- * its groups. Depths without a finite error are skipped and the result is
- * strictly increasing. Passing `0` yields the original mesh and `Infinity`
- * the coarsest cut.
- */
-export function getLodErrors(data: MeshletData): number[] {
-  const maxPerDepth = new Float64Array(data.levelCount).fill(-1);
-  for (let g = 0; g < data.groupCount; g++) {
-    const e = data.groupError[g];
-    const d = data.groupDepth[g];
-    if (Number.isFinite(e) && d < data.levelCount && e > maxPerDepth[d]) maxPerDepth[d] = e;
-  }
-
-  const errors: number[] = [];
-  for (let d = 0; d < data.levelCount; d++) {
-    const e = maxPerDepth[d];
-    if (e < 0) continue;
-    if (errors.length === 0 || e > errors[errors.length - 1]) errors.push(e);
-  }
-  return errors;
 }
 
 /**

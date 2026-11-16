@@ -150,3 +150,27 @@ export function countTriangles(data: MeshletData, clusters: ArrayLike<number>, c
   for (let i = 0; i < count; i++) indices += data.clusterIndexCount[clusters[i]];
   return indices / 3;
 }
+
+/**
+ * Suggested error thresholds for {@link createLodGeometry}, one per DAG
+ * level, coarsest last: for each depth the largest finite `groupError` among
+ * its groups. Depths without a finite error are skipped and the result is
+ * strictly increasing. Passing `0` yields the original mesh and `Infinity`
+ * the coarsest cut.
+ */
+export function getLodErrors(data: MeshletData): number[] {
+  const maxPerDepth = new Float64Array(data.levelCount).fill(-1);
+  for (let g = 0; g < data.groupCount; g++) {
+    const e = data.groupError[g];
+    const d = data.groupDepth[g];
+    if (Number.isFinite(e) && d < data.levelCount && e > maxPerDepth[d]) maxPerDepth[d] = e;
+  }
+
+  const errors: number[] = [];
+  for (let d = 0; d < data.levelCount; d++) {
+    const e = maxPerDepth[d];
+    if (e < 0) continue;
+    if (errors.length === 0 || e > errors[errors.length - 1]) errors.push(e);
+  }
+  return errors;
+}

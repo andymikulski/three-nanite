@@ -36,7 +36,17 @@ interface Header {
   clusterCount: number;
   groupCount: number;
   levelCount: number;
+  /** Bytes per index in the "indices" section: 2 or 4. Absent in older files, meaning 4. */
+  indexBytes?: number;
   sections: SectionEntry[];
+}
+
+/** Options for {@link serializeMeshlets}. */
+export interface SerializeOptions {
+  /** Write the vertex attributes (default true). With false the file holds the hierarchy only. */
+  attributes?: boolean;
+  /** Store indices as 16-bit when `vertexCount <= 65536` (default false). They are widened to Uint32Array on load. */
+  compactIndices?: boolean;
 }
 
 const BYTES: Record<SectionType, number> = { f32: 4, u8: 1, u16: 2, u32: 4, i8: 1, i16: 2, i32: 4 };
@@ -96,13 +106,21 @@ const align8 = (n: number): number => (n + 7) & ~7;
 /**
  * Serializes meshlet data into a single binary container (see
  * {@link MESHLET_FILE_EXTENSION}). The result can be written to disk, fetched,
- * and handed to {@link deserializeMeshlets}, which maps it without copying.
+ * and handed to {@link deserializeMeshlets}, which maps it without copying
+ * (except for 16-bit indices, which are widened into a new `Uint32Array`).
+ *
+ * With `options.attributes === false` only the hierarchy is written; the
+ * loaded data has no attributes and cannot be rendered, but it can drive a
+ * `ClusterSelector`.
  */
-export function serializeMeshlets(data: MeshletData): ArrayBuffer {
+export function serializeMeshlets(data: MeshletData, options: SerializeOptions = {}): ArrayBuffer {
   assertLittleEndian();
 
+  const withAttributes = options.attributes !== false;
+  const compact = options.compactIndices === true && data.vertexCount <= 65536;
+
   const sources: { entry: SectionEntry; array: TypedArray }[] = [];
-  for (const a of data.attributes) {
+  for (const a of withAttributes ? data.attributes : []) {
     sources.push({
       entry: {
         name: a.name,
@@ -117,7 +135,7 @@ export function serializeMeshlets(data: MeshletData): ArrayBuffer {
     });
   }
   for (const name of FIXED_NAMES) {
-    const array = data[name] as TypedArray;
+    const array = name === "indices" && compact ? Uint16Array.from(data.indices) : (data[name] as TypedArray);
     sources.push({ entry: { name, type: typeOf(array), offset: 0, length: array.length }, array });
   }
 
@@ -134,6 +152,7 @@ export function serializeMeshlets(data: MeshletData): ArrayBuffer {
       clusterCount: data.clusterCount,
       groupCount: data.groupCount,
       levelCount: data.levelCount,
+      ...(compact ? { indexBytes: 2 } : {}),
       sections: sources.map((s) => s.entry),
     };
     return { json: encoder.encode(JSON.stringify(header)), total: offset };
@@ -208,10 +227,12 @@ export function deserializeMeshlets(buffer: ArrayBuffer | Uint8Array): MeshletDa
     !isCount(header.vertexCount) ||
     !isCount(header.clusterCount) ||
     !isCount(header.groupCount) ||
-    !isCount(header.levelCount)
+    !isCount(header.levelCount) ||
+    (header.indexBytes !== undefined && header.indexBytes !== 2 && header.indexBytes !== 4)
   ) {
     throw new Error("Corrupt meshlet file: invalid header");
   }
+  const indexType: SectionType = header.indexBytes === 2 ? "u16" : "u32";
 
   const payloadStart = PREAMBLE_BYTES + headerBytes;
   const attributes: MeshletAttribute[] = [];
@@ -244,15 +265,17 @@ export function deserializeMeshlets(buffer: ArrayBuffer | Uint8Array): MeshletDa
       }
       attributes.push({ name: s.name, array, itemSize: s.itemSize, normalized: s.normalized === true });
     } else {
-      fixed.set(s.name, array);
-      const expected = (FIXED_SECTIONS as Record<string, SectionType>)[s.name];
+      const expected = s.name === "indices" ? indexType : (FIXED_SECTIONS as Record<string, SectionType>)[s.name];
       if (expected !== undefined && expected !== s.type) {
         throw new Error(`Corrupt meshlet file: section "${s.name}" has type ${s.type}, expected ${expected}`);
       }
+      // 16-bit indices are widened so that consumers always see a Uint32Array
+      fixed.set(s.name, array instanceof Uint16Array && s.name === "indices" ? Uint32Array.from(array) : array);
     }
   }
 
-  if (attributes.length === 0 || attributes[0].name !== "position" || attributes[0].itemSize !== 3) {
+  // no attributes at all is a hierarchy-only file
+  if (attributes.length > 0 && (attributes[0].name !== "position" || attributes[0].itemSize !== 3)) {
     throw new Error("Corrupt meshlet file: the first attribute must be a 3-component position");
   }
 

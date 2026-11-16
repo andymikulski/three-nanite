@@ -219,6 +219,9 @@ export class MeshletMesh extends Object3D {
    */
   constructor(data: MeshletData, material?: Material, options: MeshletMeshOptions = {}) {
     super();
+    if (data.attributes.length === 0) {
+      throw new Error("three-nanite: this MeshletData holds no vertex attributes (hierarchy only)");
+    }
     this.data = data;
     this.errorThreshold = options.errorThreshold ?? 1;
 
