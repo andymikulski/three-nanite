@@ -38,6 +38,25 @@ export interface BuildMeshletsOptions {
   fallbackSloppy?: boolean;
   /** Error multiplier for sloppy results. Default 2. */
   sloppyErrorFactor?: number;
+  /**
+   * Caps the error a simplification step records at this many times the edge length of the triangles
+   * it started from (per triangle the longer of its shortest edge and half its longest; the largest in
+   * the group counts). A level is then drawn at the latest when the triangles under it are about
+   * `errorThreshold / errorEdgeLimit` pixels long, however large its measured error (meshoptimizer's
+   * `simplify_error_edge_limit`). It is meant for dense connected surfaces whose attribute error is
+   * out of proportion to their triangles. 0 (the default) records the measured error.
+   *
+   * Not for foliage made of loose cards: simplifying those removes cards without making the rest any
+   * longer, so every level gets the same cap and the whole mesh drops to its coarsest level at once.
+   */
+  errorEdgeLimit?: number;
+  /**
+   * The hierarchy normally ends when one cluster is left, which leaves up to `maxTriangles` triangles
+   * drawn however far away the mesh is. With this the last cluster keeps being simplified, each step a
+   * level of its own, until it has at most this many triangles or does not simplify any more. Default 8;
+   * `Infinity` ends at one cluster, as meshoptimizer's clusterlod does.
+   */
+  coarsestTriangles?: number;
   /** Per-attribute-name weight for attribute-aware simplification (applied to every component). Default `{ normal: 0.5 }`. */
   attributeWeights?: Record<string, number>;
   /** Attribute names whose seams get the meshopt "Protect" vertex bit. Default `["uv", "uv1", "uv2", "uv3"]`. */
@@ -103,6 +122,10 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
   const errorMergeAdditive = options.errorMergeAdditive ?? 0;
   const fallbackSloppy = options.fallbackSloppy ?? true;
   const sloppyErrorFactor = options.sloppyErrorFactor ?? 2;
+  const errorEdgeLimit = options.errorEdgeLimit ?? 0;
+  if (!(errorEdgeLimit >= 0)) throw new Error("buildMeshlets: errorEdgeLimit must be >= 0");
+  const coarsestTriangles = options.coarsestTriangles ?? 8;
+  if (!(coarsestTriangles >= 1)) throw new Error("buildMeshlets: coarsestTriangles must be >= 1");
   const onProgress = options.onProgress;
 
   // ---- input ----------------------------------------------------------------
@@ -226,8 +249,9 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
 
   let depth = 0;
 
-  // merge and simplify clusters until we can't merge anymore
-  while (clusters.length > 1) {
+  // merge and simplify clusters until we can't merge anymore; a single cluster left is a group of
+  // its own (nothing to lock but the caller's pins) while it is above `coarsestTriangles`
+  while (clusters.length > 1 || (clusters.length === 1 && clusters[0].indices.length / 3 > coarsestTriangles)) {
     onProgress?.({ level: depth, clusterCount: clusters.length });
 
     const groupOffsets = partitionLevel(clusters, partitionSize, positions, remap, vertexCount);
@@ -265,6 +289,7 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
         targetSize,
         fallbackSloppy,
         sloppyErrorFactor,
+        errorEdgeLimit,
       );
 
       if (sres.indices.length > merged.length * simplifyThreshold) {
@@ -677,6 +702,7 @@ function simplifyLocal(
   targetSize: number,
   fallbackSloppy: boolean,
   sloppyErrorFactor: number,
+  errorEdgeLimit: number,
 ): SimplifyResult {
   const localIndices = scratch.indices;
   const localLocks = scratch.locks.subarray(0, localCount);
@@ -705,5 +731,31 @@ function simplifyLocal(
   // never emit an empty group: it would break DAG invariants
   if (result.length === 0) result = localIndices.slice(0, 3);
 
+  // optionally limit the error by the edge length of the triangles simplified (clusterlod.h
+  // simplify_error_edge_limit): what a step gets wrong is no bigger than the triangles it replaced
+  if (errorEdgeLimit > 0) {
+    let maxEdgeSq = 0;
+    for (let i = 0; i < localIndices.length; i += 3) {
+      const a = localIndices[i] * 3;
+      const b = localIndices[i + 1] * 3;
+      const c = localIndices[i + 2] * 3;
+      const ab = distSq(localPositions, a, b);
+      const ac = distSq(localPositions, a, c);
+      const bc = distSq(localPositions, b, c);
+      const emax = Math.max(ab, ac, bc);
+      const emin = Math.min(ab, ac, bc);
+      // the shortest edge, so thin triangles count as thin, with a stopgap for long slivers
+      maxEdgeSq = Math.max(maxEdgeSq, emin, emax / 4);
+    }
+    error = Math.min(error, Math.sqrt(maxEdgeSq) * errorEdgeLimit);
+  }
+
   return { indices: result, error };
+}
+
+function distSq(p: Float32Array, a: number, b: number): number {
+  const x = p[a] - p[b];
+  const y = p[a + 1] - p[b + 1];
+  const z = p[a + 2] - p[b + 2];
+  return x * x + y * y + z * z;
 }

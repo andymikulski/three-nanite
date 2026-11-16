@@ -18,7 +18,7 @@ import { makeFixture } from "./helpers/fixture.js";
 const H = 1080;
 
 function makeMesh(options?: MeshletMeshOptions): MeshletMesh {
-  return new MeshletMesh(makeFixture(), new MeshBasicMaterial(), options);
+  return new MeshletMesh(makeFixture(), new MeshBasicMaterial(), { mergeClusters: false, ...options });
 }
 
 function makeCamera(z: number, x = 0, y = 0): PerspectiveCamera {
@@ -50,7 +50,7 @@ const translation = (x: number, y = 0, z = 0) => new Matrix4().makeTranslation(x
 describe("MeshletMesh construction", () => {
   it("builds one index-only geometry per cluster whose id equals the cluster id", () => {
     const data = makeFixture();
-    const mesh = new MeshletMesh(data, new MeshBasicMaterial());
+    const mesh = new MeshletMesh(data, new MeshBasicMaterial(), { mergeClusters: false });
     expect(mesh.isMeshletMesh).toBe(true);
     expect(mesh.children).toContain(mesh.batched);
     const sphere = new Sphere();
@@ -290,7 +290,7 @@ describe("MeshletMesh instances", () => {
   it("grows the draw capacity by rebuilding the draw mesh", () => {
     const data = makeFixture();
     const material = new MeshBasicMaterial();
-    const mesh = new MeshletMesh(data, material, { initialDrawCapacity: 2, maxInstances: 1 });
+    const mesh = new MeshletMesh(data, material, { initialDrawCapacity: 2, maxInstances: 1, mergeClusters: false });
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.renderOrder = 3;

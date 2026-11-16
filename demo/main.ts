@@ -26,7 +26,7 @@ const demo: DemoApi = (window.__demo = {
   frames: 0,
   mesh: null,
   stats: () => ({
-    ...(demo.mesh?.stats ?? { instances: 0, clusters: 0, triangles: 0, slots: 0, lastUpdateMs: 0, lastSelected: 0 }),
+    ...(demo.mesh?.stats ?? { instances: 0, clusters: 0, draws: 0, triangles: 0, slots: 0, lastUpdateMs: 0, lastSelected: 0 }),
     fullTriangles: fullTriangles(),
     fps,
   }),

@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type * as THREE from "three";
 import { buildMeshlets } from "../src/build/buildMeshlets.js";
 import { validateMeshletData } from "../src/core/validate.js";
-import { ClusterSelector } from "../src/core/select.js";
+import { ClusterSelector, countTriangles } from "../src/core/select.js";
 import type { MeshletData, MeshletInput } from "../src/types.js";
 import { makeFixture } from "./helpers/fixture.js";
 import {
@@ -88,12 +88,14 @@ describe("buildMeshlets: closed meshes", () => {
           if (cut.stats.triangles >= 300) {
             expect(cut.stats.overused, `${cut.label}: over-used edges`).toBe(0);
             expect(cut.stats.duplicateDirected, `${cut.label}: duplicate directed edges`).toBe(0);
-          } else {
+          } else if (cut.stats.triangles >= 64) {
             // The topmost group of a thin tube (torus knot) is simplified below the topological
             // resolution of the tube, which can pinch a couple of edges into non-manifold ones.
             // That is simplifier behaviour inside a single group, not a crack.
             expect(cut.stats.overused, `${cut.label}: over-used edges`).toBeLessThanOrEqual(2);
           }
+          // Below that are the levels of the last cluster by itself (`coarsestTriangles`): a closed
+          // tube of a few triangles is a folded sheet, more pinched still, and still has no open edge.
         }
 
         // first 11 cuts are error 0 .. max in 10 steps, then Infinity
@@ -315,4 +317,41 @@ describe("buildMeshlets: performance", () => {
     expect(validateMeshletData(data)).toEqual([]);
     expect(ms).toBeLessThan(30_000);
   }, 120_000);
+});
+
+describe("buildMeshlets: coarsest level and error limit", () => {
+  const coarsestTriangles = (data: MeshletData): number => {
+    const out = new Uint32Array(data.clusterCount);
+    return countTriangles(data, out, new ClusterSelector(data).selectByError(out, Infinity));
+  };
+
+  it("keeps simplifying the last cluster down to coarsestTriangles", async () => {
+    const input = geometryToInput(icosphere(24, true));
+    const tail = await buildMeshlets(input);
+    const stop = await buildMeshlets(input, { coarsestTriangles: Infinity });
+    expect(validateMeshletData(tail)).toEqual([]);
+    // ending at one cluster leaves a good part of a cluster drawn at any distance
+    expect(coarsestTriangles(stop)).toBeGreaterThan(16);
+    expect(coarsestTriangles(tail)).toBeLessThanOrEqual(8);
+    expect(tail.levelCount).toBeGreaterThan(stop.levelCount);
+    // the finer levels are the same hierarchy
+    expect(Array.from(tail.indices.subarray(0, stop.indices.length))).toEqual(Array.from(stop.indices));
+  });
+
+  it("errorEdgeLimit only ever lowers the recorded errors", async () => {
+    const input = geometryToInput(torusKnot(128, 24, true));
+    const measured = await buildMeshlets(input);
+    // a smooth dense surface simplifies with errors far below its edge lengths, so the cap has to be tiny to bind
+    const capped = await buildMeshlets(input, { errorEdgeLimit: 0.002 });
+    expect(validateMeshletData(capped)).toEqual([]);
+    expect(capped.groupCount).toBe(measured.groupCount);
+    let lower = 0;
+    for (let g = 0; g < capped.groupCount; g++) {
+      expect(capped.groupError[g]).toBeLessThanOrEqual(measured.groupError[g]);
+      if (capped.groupError[g] < measured.groupError[g]) lower++;
+    }
+    expect(lower).toBeGreaterThan(0);
+    await expect(buildMeshlets(input, { errorEdgeLimit: -1 })).rejects.toThrow(/errorEdgeLimit/);
+    await expect(buildMeshlets(input, { coarsestTriangles: 0 })).rejects.toThrow(/coarsestTriangles/);
+  });
 });

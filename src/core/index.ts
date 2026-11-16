@@ -7,6 +7,7 @@
 export type { MeshletAttribute, MeshletData, MeshletInput, TypedArray } from "../types.js";
 
 export { ClusterSelector, countTriangles, getLodErrors, lodScale } from "./select.js";
+export { computeDrawRanges, rangesOfCut, type DrawRanges } from "./ranges.js";
 export {
   deserializeMeshlets,
   MESHLET_FILE_EXTENSION,

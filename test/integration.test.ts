@@ -87,7 +87,7 @@ describe("build -> serialize -> render pipeline", () => {
     const batched = mesh.batched;
     for (let slot = 0; slot < batched.instanceCount; slot++) {
       if (!batched.getVisibleAt(slot)) continue;
-      perInstance[mesh.slotInstance[slot]] += data.clusterIndexCount[batched.getGeometryIdAt(slot)] / 3;
+      perInstance[mesh.slotInstance[slot]] += mesh.ranges.indexCount[batched.getGeometryIdAt(slot)] / 3;
     }
     expect(perInstance[0]).toBeGreaterThan(perInstance[1]);
     expect(perInstance[1]).toBeGreaterThan(perInstance[2]);

@@ -11,6 +11,8 @@ import {
   Vector3,
 } from "three";
 import type { Camera, Material, Raycaster, Intersection } from "three";
+import { computeDrawRanges, rangesOfCut } from "../core/ranges.js";
+import type { DrawRanges } from "../core/ranges.js";
 import { ClusterSelector, lodScale } from "../core/select.js";
 import type { MeshletData, TypedArray } from "../types.js";
 
@@ -21,8 +23,14 @@ export type DebugColorMode = "none" | "cluster" | "lod";
 export interface MeshletMeshOptions {
   /** Initial instance capacity (grows automatically by doubling). Default 16. */
   maxInstances?: number;
-  /** Initial number of draw slots (one slot = one drawn cluster of one instance); grows by doubling. Default 1024. */
+  /** Initial number of draw slots (one slot = one drawn range of one instance); grows by doubling. Default 1024. */
   initialDrawCapacity?: number;
+  /**
+   * Draw clusters that are always drawn together as one index range (see `computeDrawRanges`): 3 to 16
+   * times fewer draws for the same triangles. Default true. Turn it off to draw, cull and colour every
+   * cluster by itself, for example to look at the clusters with `debugColors = "cluster"`.
+   */
+  mergeClusters?: boolean;
   /** Allowed geometric error in pixels. Default 1. */
   errorThreshold?: number;
 }
@@ -33,6 +41,8 @@ export interface MeshletMeshStats {
   instances: number;
   /** Clusters currently drawn, summed over all instances (before frustum culling). */
   clusters: number;
+  /** Draws those clusters take (draw ranges, summed over all instances): what the frame pays per pass. */
+  draws: number;
   /** Triangles currently drawn, summed over all instances (before frustum culling). */
   triangles: number;
   /** Draw slot capacity in use (`batched.instanceCount`). */
@@ -114,9 +124,11 @@ function growUint8(a: Uint8Array, length: number) {
  *
  * It owns a stock `THREE.BatchedMesh` ({@link MeshletMesh.batched}) and only
  * uses its public API, so it works on `WebGLRenderer` and `WebGPURenderer`
- * with any standard material, shadows included. Each drawn
- * `(instance, cluster)` pair is one BatchedMesh instance, called a SLOT here,
- * which is created lazily and recycled through a free list.
+ * with any standard material, shadows included. A cut is drawn in DRAW RANGES
+ * ({@link MeshletMesh.ranges}: runs of clusters that are always drawn together,
+ * fused into one index range). Each drawn `(instance, range)` pair is one
+ * BatchedMesh instance, called a SLOT here, which is created lazily and
+ * recycled through a free list.
  *
  * The public interface is InstancedMesh-like: {@link count},
  * {@link setMatrixAt}, {@link setColorAt}. Instance 0 exists by default with an
@@ -142,6 +154,7 @@ export class MeshletMesh extends Object3D {
   readonly stats: MeshletMeshStats = {
     instances: 0,
     clusters: 0,
+    draws: 0,
     triangles: 0,
     slots: 0,
     lastUpdateMs: 0,
@@ -149,6 +162,8 @@ export class MeshletMesh extends Object3D {
   };
   /** Slot (BatchedMesh instance id) to instance id, or -1 when the slot is free. */
   slotInstance: Int32Array;
+  /** The draw ranges of `data`. A BatchedMesh geometry id is a range id. */
+  readonly ranges: DrawRanges;
 
   private readonly selector: ClusterSelector;
   private readonly scratch: Uint32Array;
@@ -178,7 +193,8 @@ export class MeshletMesh extends Object3D {
   private dirtyList = new Int32Array(0);
   private dirtyCount = 0;
   private cutCount = new Int32Array(0);
-  private cutClusters: Uint32Array[] = [];
+  /** Per instance: the draw ranges of its cut (`cutSlots` holds the slot each is drawn through). */
+  private cutRanges: Uint32Array[] = [];
   private cutSlots: Int32Array[] = [];
 
   // ---- slots
@@ -226,9 +242,10 @@ export class MeshletMesh extends Object3D {
     this.errorThreshold = options.errorThreshold ?? 1;
 
     this.selector = new ClusterSelector(data);
+    this.ranges = computeDrawRanges(data, options.mergeClusters ?? true);
     this.scratch = new Uint32Array(data.clusterCount);
-    this.newSlots = new Int32Array(data.clusterCount);
-    this.marks = new Int32Array(data.clusterCount);
+    this.newSlots = new Int32Array(this.ranges.count);
+    this.marks = new Int32Array(this.ranges.count);
 
     this.sharedAttributes = data.attributes.map((a) => ({
       name: a.name,
@@ -239,7 +256,7 @@ export class MeshletMesh extends Object3D {
     this.sharedIndex = new BufferAttribute(data.vertexCount <= 65535 ? Uint16Array.from(data.indices) : data.indices, 1);
 
     const maxInstances = Math.max(1, Math.floor(options.maxInstances ?? 16));
-    const coarsest = this.selector.selectByError(this.scratch, Infinity);
+    const coarsest = rangesOfCut(this.ranges, this.scratch, this.selector.selectByError(this.scratch, Infinity));
     const slotCapacity = Math.max(
       coarsest,
       1,
@@ -314,7 +331,7 @@ export class MeshletMesh extends Object3D {
     this.stats.instances = n;
   }
 
-  /** `"cluster"`: random color per cluster. `"lod"`: color by DAG level. `"none"`: instance color. */
+  /** `"cluster"`: random color per draw range (per cluster with `mergeClusters: false`). `"lod"`: color by DAG level. `"none"`: instance color. */
   get debugColors(): DebugColorMode {
     return this._debugColors;
   }
@@ -355,8 +372,8 @@ export class MeshletMesh extends Object3D {
     } else if (this._debugColors === "none") {
       const n = this.cutCount[i];
       const slots = this.cutSlots[i];
-      const clusters = this.cutClusters[i];
-      for (let j = 0; j < n; j++) this.applySlotColor(slots[j], clusters[j], i);
+      const ranges = this.cutRanges[i];
+      for (let j = 0; j < n; j++) this.applySlotColor(slots[j], ranges[j], i);
     }
   }
 
@@ -475,9 +492,9 @@ export class MeshletMesh extends Object3D {
   // =========================================================================
 
   /**
-   * Creates a BatchedMesh whose geometry ids equal cluster ids and whose index layout equals `data.indices`.
+   * Creates a BatchedMesh whose geometry ids equal draw range ids and whose index layout equals `data.indices`.
    *
-   * Every cluster is added as an index-only geometry (zero vertices); afterwards the BatchedMesh's own
+   * Every draw range is added as an index-only geometry (zero vertices); afterwards the BatchedMesh's own
    * buffers are swapped for buffers that wrap the MeshletData arrays, so nothing is copied.
    */
   private createBatched(capacity: number, material: Material | undefined): BatchedMesh {
@@ -489,15 +506,16 @@ export class MeshletMesh extends Object3D {
       const ctor = a.array.constructor as new (length: number) => TypedArray;
       temp.setAttribute(a.name, new BufferAttribute(new ctor(0), a.itemSize, a.normalized));
     }
+    const ranges = this.ranges;
     let maxCount = 0;
-    for (let c = 0; c < data.clusterCount; c++) maxCount = Math.max(maxCount, data.clusterIndexCount[c]);
+    for (let c = 0; c < ranges.count; c++) maxCount = Math.max(maxCount, ranges.indexCount[c]);
     const dummyIndex = new Uint32Array(maxCount);
     temp.boundingSphere = _sphere;
     temp.boundingBox = _box;
 
-    const bounds = data.clusterBounds;
-    for (let c = 0; c < data.clusterCount; c++) {
-      const count = data.clusterIndexCount[c];
+    const bounds = ranges.bounds;
+    for (let c = 0; c < ranges.count; c++) {
+      const count = ranges.indexCount[c];
       temp.setIndex(new BufferAttribute(dummyIndex.subarray(0, count), 1));
       _center.set(bounds[c * 4], bounds[c * 4 + 1], bounds[c * 4 + 2]);
       const r = bounds[c * 4 + 3];
@@ -509,7 +527,7 @@ export class MeshletMesh extends Object3D {
       if (
         id !== c ||
         range.vertexCount !== 0 ||
-        range.indexStart !== data.clusterIndexStart[c] ||
+        range.indexStart !== ranges.indexStart[c] ||
         range.indexCount !== count
       ) {
         throw new Error(
@@ -683,7 +701,7 @@ export class MeshletMesh extends Object3D {
     this.dirtyList = growInt32(this.dirtyList, cap);
     this.cutCount = growInt32(this.cutCount, cap);
     for (let i = old; i < cap; i++) {
-      this.cutClusters.push(EMPTY_U32);
+      this.cutRanges.push(EMPTY_U32);
       this.cutSlots.push(EMPTY_I32);
     }
   }
@@ -698,8 +716,8 @@ export class MeshletMesh extends Object3D {
   private releaseInstance(i: number): void {
     const n = this.cutCount[i];
     const slots = this.cutSlots[i];
-    const clusters = this.cutClusters[i];
-    for (let j = 0; j < n; j++) this.releaseSlot(slots[j], clusters[j]);
+    const ranges = this.cutRanges[i];
+    for (let j = 0; j < n; j++) this.releaseSlot(slots[j], ranges[j]);
     this.cutCount[i] = 0;
   }
 
@@ -726,11 +744,12 @@ export class MeshletMesh extends Object3D {
     if (!(scale > MIN_SCALE)) scale = MIN_SCALE;
     const k = lodScale(this.errorThreshold, this.vHeight, this.vProj, scale, this.vOrtho);
     const scratch = this.scratch;
-    const n = this.selector.select(scratch, x, y, z, k, this.vNear / scale, this.vOrtho);
+    // the cut in clusters, then in draw ranges: everything below works in ranges
+    const n = rangesOfCut(this.ranges, scratch, this.selector.select(scratch, x, y, z, k, this.vNear / scale, this.vOrtho));
 
     const oldN = this.cutCount[i];
-    // Worst case every drawn cluster of this instance is replaced: make sure the slots fit before diffing.
-    const needed = this.stats.clusters - oldN + n;
+    // Worst case every drawn range of this instance is replaced: make sure the slots fit before diffing.
+    const needed = this.stats.draws - oldN + n;
     if (this._batched.maxInstanceCount < needed) {
       // Rebuilding is not free, so aim past this instance: assume the instances still to be
       // selected in this update need about as much as the ones done so far.
@@ -741,14 +760,14 @@ export class MeshletMesh extends Object3D {
 
     const marks = this.marks;
     const newSlots = this.newSlots;
-    const oldClusters = this.cutClusters[i];
+    const oldRanges = this.cutRanges[i];
     const oldSlots = this.cutSlots[i];
     let changed = false;
 
     for (let j = 0; j < n; j++) marks[scratch[j]] = 1;
     // releases first, so freed slots are recycled by the acquires below
     for (let j = 0; j < oldN; j++) {
-      const c = oldClusters[j];
+      const c = oldRanges[j];
       if (marks[c] === 1) {
         marks[c] = oldSlots[j] + 2; // kept
       } else {
@@ -770,15 +789,15 @@ export class MeshletMesh extends Object3D {
     }
 
     if (changed || n !== oldN) {
-      let clusters = this.cutClusters[i];
+      let ranges = this.cutRanges[i];
       let slots = this.cutSlots[i];
-      if (clusters.length < n) {
-        const cap = Math.max(n, clusters.length * 2);
-        clusters = this.cutClusters[i] = new Uint32Array(cap);
+      if (ranges.length < n) {
+        const cap = Math.max(n, ranges.length * 2);
+        ranges = this.cutRanges[i] = new Uint32Array(cap);
         slots = this.cutSlots[i] = new Int32Array(cap);
       }
       for (let j = 0; j < n; j++) {
-        clusters[j] = scratch[j];
+        ranges[j] = scratch[j];
         slots[j] = newSlots[j];
       }
       this.cutCount[i] = n;
@@ -786,13 +805,13 @@ export class MeshletMesh extends Object3D {
     return changed;
   }
 
-  /** Takes a slot from the free list (or creates one) and points it at cluster `c` of instance `i`. Uses `_m` as the instance matrix. */
+  /** Takes a slot from the free list (or creates one) and points it at draw range `c` of instance `i`. Uses `_m` as the instance matrix. */
   private acquireSlot(c: number, i: number): number {
     let slot: number;
     if (this.freeCount > 0) {
       slot = this.freeSlots[--this.freeCount];
       const batched = this._batched;
-      batched.setGeometryIdAt(slot, c); // geometry id === cluster id
+      batched.setGeometryIdAt(slot, c); // geometry id === draw range id
       batched.setMatrixAt(slot, _m);
       if (this.colorsInUse) this.applySlotColor(slot, c, i);
       batched.setVisibleAt(slot, true);
@@ -806,8 +825,9 @@ export class MeshletMesh extends Object3D {
       this.stats.slots = batched.instanceCount;
     }
     this.slotInstance[slot] = i;
-    this.stats.clusters++;
-    this.stats.triangles += this.data.clusterIndexCount[c] / 3;
+    this.stats.draws++;
+    this.stats.clusters += this.ranges.clusterCount[c];
+    this.stats.triangles += this.ranges.indexCount[c] / 3;
     return slot;
   }
 
@@ -815,8 +835,9 @@ export class MeshletMesh extends Object3D {
     this._batched.setVisibleAt(slot, false);
     this.slotInstance[slot] = -1;
     this.freeSlots[this.freeCount++] = slot;
-    this.stats.clusters--;
-    this.stats.triangles -= this.data.clusterIndexCount[c] / 3;
+    this.stats.draws--;
+    this.stats.clusters -= this.ranges.clusterCount[c];
+    this.stats.triangles -= this.ranges.indexCount[c] / 3;
   }
 
   // =========================================================================
@@ -831,7 +852,7 @@ export class MeshletMesh extends Object3D {
         break;
       }
       case "lod": {
-        const depth = this.data.groupDepth[this.data.clusterGroup[c]];
+        const depth = this.data.groupDepth[this.data.clusterGroup[this.ranges.firstCluster[c]]];
         _color.copy(LOD_PALETTE[depth % LOD_PALETTE.length]);
         break;
       }
@@ -845,8 +866,8 @@ export class MeshletMesh extends Object3D {
     for (let i = 0; i < this._count; i++) {
       const n = this.cutCount[i];
       const slots = this.cutSlots[i];
-      const clusters = this.cutClusters[i];
-      for (let j = 0; j < n; j++) this.applySlotColor(slots[j], clusters[j], i);
+      const ranges = this.cutRanges[i];
+      for (let j = 0; j < n; j++) this.applySlotColor(slots[j], ranges[j], i);
     }
   }
 }

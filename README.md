@@ -68,12 +68,13 @@ That is all: the level of detail is recomputed automatically for the camera bein
 | `createLodChain(data, { maxLevels })` / `getLodErrors(data)` | A conventional discrete LOD chain out of the same hierarchy. |
 | `geometryToMeshletInput(geometry)` | `BufferGeometry` to builder input. |
 | `ClusterSelector`, `lodScale`, `countTriangles` | The LOD selection itself, free of three.js objects, for custom renderers. |
+| `computeDrawRanges(data)`, `rangesOfCut(ranges, cut, n)` | The index ranges a cut is drawn in: clusters that are always drawn together, fused. |
 | `validateMeshletData(data)` | Consistency check; returns a list of problems. |
 
 #### `MeshletMesh`
 
 ```ts
-new MeshletMesh(data, material?, { maxInstances?, initialDrawCapacity?, errorThreshold? })
+new MeshletMesh(data, material?, { maxInstances?, initialDrawCapacity?, errorThreshold?, mergeClusters? })
 ```
 
 It behaves like an `InstancedMesh`:
@@ -86,8 +87,8 @@ It behaves like an `InstancedMesh`:
 | `errorThreshold` | Allowed geometric error in **pixels** (default 1). The quality/performance dial. |
 | `autoUpdate` | Default `true`: LOD is refreshed from the render hooks. Set `false` and call `update(camera, viewportHeight)` yourself for full control. |
 | `lodCamera` | Pin LOD to one camera regardless of which camera renders (debugging, or keeping reflections in step with the main view). |
-| `debugColors` | `"none"`, `"cluster"` or `"lod"`: tints each drawn cluster, on any material and renderer. |
-| `stats` | `{ instances, clusters, triangles, slots, lastUpdateMs, lastSelected }`. |
+| `debugColors` | `"none"`, `"cluster"` or `"lod"`: tints each draw range, on any material and renderer. Construct with `mergeClusters: false` to tint (and draw) every cluster by itself. |
+| `stats` | `{ instances, clusters, draws, triangles, slots, lastUpdateMs, lastSelected }`. `draws` is what a pass pays for. |
 | `material`, `castShadow`, `receiveShadow`, `renderOrder`, `layers` | Forwarded to the internal draw mesh. |
 | `batched`, `drawCapacity`, `onRebuild` | The internal `THREE.BatchedMesh`; see "Draw capacity" below. |
 | `dispose()` | Frees GPU buffers and textures (not the material). |
@@ -98,7 +99,8 @@ Things worth knowing:
 
 - **LOD follows the viewer, in every pass.** Shadow passes reuse the cut chosen for the main camera, so a shadow always matches the mesh that casts it. Frustum culling, on the other hand, is done per cluster for each pass's own camera.
 - **Camera rotation is free.** The cut depends only on the camera position, projection, viewport height and threshold. If none of those changed and no instance moved, `update` returns immediately. If only some instances moved, only those are re-evaluated.
-- **Draw capacity.** Every drawn (instance, cluster) pair occupies a slot of the internal `BatchedMesh`. When slots run out the internal mesh is rebuilt with more capacity and `batched` becomes a new object. The vertex and index buffers are shared, so nothing is re-uploaded, but re-registering the clusters takes a few milliseconds per thousand clusters (about 20 ms for the 6,400 cluster mesh above), a visible hitch if it happens mid-game. Pass `initialDrawCapacity` (watch `stats.clusters` for a realistic number) to avoid it, and use `onRebuild` if you customise `batched` directly.
+- **Draws.** Clusters that are always drawn together (same group, simplified from the same group) are stored next to each other, so each such run is one index range and one draw: the whole finest level of a group is a single draw, and a cut takes 3 to 16 times fewer draws than it has clusters. A small prop at full detail is one or two draws. `mergeClusters: false` goes back to a draw per cluster.
+- **Draw capacity.** Every drawn (instance, draw range) pair occupies a slot of the internal `BatchedMesh`. When slots run out the internal mesh is rebuilt with more capacity and `batched` becomes a new object. The vertex and index buffers are shared, so nothing is re-uploaded, but re-registering the clusters takes a few milliseconds per thousand clusters (about 20 ms for the 6,400 cluster mesh above), a visible hitch if it happens mid-game. Pass `initialDrawCapacity` (watch `stats.draws` for a realistic number) to avoid it, and use `onRebuild` if you customise `batched` directly.
 - **Cost of an update.** Flying a camera through 1,024 instances of that mesh costs about 0.9 ms of LOD selection per frame on a desktop CPU, 0.3 ms for 64 instances.
 - **Per-instance data** beyond matrix and color has no slot of its own. Custom shaders can read the per-draw id three exposes for batching; `InstancedBufferAttribute`s do not apply.
 
@@ -141,6 +143,8 @@ The defaults follow meshoptimizer's `clodDefaultConfig(128)`. The options most l
 | `attributes` | all | Which attributes to bake (`buildMeshletsFromGeometry` only). |
 | `lockedVertices` | none | One number per vertex; non-zero keeps that vertex, and every vertex at the same position, where it is at every level. For vertices shared with a neighbouring mesh that is simplified on its own, such as the borders of terrain tiles, so no crack opens between them. Locked vertices limit how coarse the mesh can become. |
 | `fallbackSloppy` | `true` | Use sloppy simplification when regular simplification gets stuck. It does not preserve attribute seams; turn it off when they matter. |
+| `coarsestTriangles` | 8 | The last cluster keeps being simplified, a level a step, until it has at most this many triangles, so a far instance costs a handful of triangles and not most of a cluster. `Infinity` stops at one cluster, as clusterlod does. |
+| `errorEdgeLimit` | 0 (off) | Caps the error of a step at this many times the edge length of the triangles it simplified (clusterlod's `simplify_error_edge_limit`). For dense surfaces whose attribute error is out of proportion; not for foliage made of loose cards, where every level gets the same cap. |
 | `onProgress` | | Called once per level. |
 
 The builder is deterministic and does not modify or copy the vertex arrays: the result references the arrays you passed in.
@@ -201,7 +205,7 @@ Guidance on where it pays off:
 
 - It needs triangles to remove. Below a few thousand triangles per model there is little to gain over a single mesh.
 - It relies on connected surfaces. Alpha-tested foliage made of separate cards simplifies poorly (the same is true of Nanite); impostors remain the better tool there, and the two combine well: meshlets up close and at mid range, an impostor past the distance where the coarsest cut is still too heavy.
-- Each drawn cluster is one sub-draw. WebGL 2 submits them all in a single `multiDraw` call; the WebGPU back-end issues one `drawIndexed` per cluster, which is cheap but not free. Raise `errorThreshold` or `maxTriangles` on low-end devices.
+- Each draw range of each instance is one sub-draw. WebGL 2 submits them all in a single `multiDraw` call; the WebGPU back-end issues one `drawIndexed` per range, which is cheap but not free. For a model that never gets coarser on screen (a low-poly prop seen close), plain instancing draws the same triangles in one draw.
 - Memory: vertices are stored once. The index buffer is about twice the original, and each slot costs 84 bytes of texture.
 
 ## How it works
