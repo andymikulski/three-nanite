@@ -19,6 +19,7 @@ import type { LodLevels } from "../core/levels.js";
 import { computeDrawRanges, rangesOfCut } from "../core/ranges.js";
 import type { DrawRanges } from "../core/ranges.js";
 import { ClusterSelector, lodScale } from "../core/select.js";
+import { frustumPlanesIn, PLANE_FLOATS } from "./viewPlanes.js";
 import type { MeshletData, TypedArray } from "../types.js";
 
 /** How drawn clusters are tinted. */
@@ -131,8 +132,6 @@ interface LevelBucket {
 
 const DEFAULT_NEAR = 0.1;
 const MIN_SCALE = 1e-20;
-/** Frustum planes of a culling pass: left, right, bottom, top, near; four numbers each. */
-const PLANE_FLOATS = 20;
 /** A bounding sphere no frustum contains: what a draw mesh carries while nothing of it is in view. */
 const NEVER_IN_VIEW = new Sphere(new Vector3(), -Infinity);
 
@@ -150,65 +149,6 @@ class AfterDrawMeshes extends Object3D {
   update(): void {
     this.run();
   }
-}
-
-/**
- * The frustum of the camera last asked about, as planes in world space: left, right, bottom, top
- * and near, each `[nx, ny, nz, d]` with a unit normal pointing inwards. The far plane is left out
- * (it rarely culls anything, and the side planes are the same in every clip space convention).
- * It is kept because the meshes of a scene all ask about the same camera.
- */
-const _viewPlanes = new Float64Array(PLANE_FLOATS);
-const _viewKey = new Float64Array(32);
-let _viewCamera: Camera | null = null;
-let _viewOk = false;
-
-/** Brings `_viewPlanes` up to date for `camera`. Returns false for a degenerate projection. */
-function viewPlanes(camera: Camera): boolean {
-  const p = camera.projectionMatrix.elements;
-  const v = camera.matrixWorldInverse.elements;
-  const key = _viewKey;
-  let same = camera === _viewCamera;
-  for (let j = 0; same && j < 16; j++) if (key[j] !== v[j] || key[16 + j] !== p[j]) same = false;
-  if (same) return _viewOk;
-  _viewCamera = camera;
-  for (let j = 0; j < 16; j++) {
-    key[j] = v[j];
-    key[16 + j] = p[j];
-  }
-
-  const out = _viewPlanes;
-  const c = _clip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).elements;
-  // clip space: -w <= x <= w and -w <= y <= w
-  for (let side = 0; side < 4; side++) {
-    const axis = side >> 1;
-    const sign = (side & 1) === 0 ? 1 : -1;
-    const o = side * 4;
-    out[o] = c[3] + sign * c[axis];
-    out[o + 1] = c[7] + sign * c[4 + axis];
-    out[o + 2] = c[11] + sign * c[8 + axis];
-    out[o + 3] = c[15] + sign * c[12 + axis];
-  }
-  // view space: in front of the near plane (three's cameras look down -z)
-  const near = (camera as { near?: number }).near ?? 0;
-  out[16] = -v[2];
-  out[17] = -v[6];
-  out[18] = -v[10];
-  out[19] = -v[14] - near;
-
-  _viewOk = true;
-  for (let o = 0; o < PLANE_FLOATS; o += 4) {
-    const length = Math.hypot(out[o], out[o + 1], out[o + 2]);
-    if (!(length > 0) || !Number.isFinite(length)) {
-      _viewOk = false;
-      break;
-    }
-    out[o] /= length;
-    out[o + 1] /= length;
-    out[o + 2] /= length;
-    out[o + 3] /= length;
-  }
-  return _viewOk;
 }
 
 let _wanted = new Int32Array(64);
@@ -289,6 +229,32 @@ function touchRange(attribute: BufferAttribute, start: number, count: number): v
     r.count = end - r.start;
   }
   attribute.needsUpdate = true;
+}
+
+/**
+ * The height of what each camera was last seen rendering to. It is a fact about the camera, not
+ * about a mesh, so all meshes share it: one that has not been drawn yet knows it all the same, and
+ * one draw a frame notes it for all of them.
+ */
+const _heights = new WeakMap<Camera, number>();
+/** The height last noted, and the camera it was noted for. */
+let _height = 0;
+let _heightCamera: Camera | null = null;
+/** The camera whose viewport has been noted since a mesh was last updated. */
+let _notedCamera: Camera | null = null;
+/** Whether the three.js in use has the WebGPURenderer that cannot draw by level (see `WEBGPU_LEVELS_REVISION`). */
+const LEVELS_NEED_CHECK = THREE_REVISION < WEBGPU_LEVELS_REVISION;
+
+/** Remembers the height of what `camera` renders to, for the automatic updates of the next frame. */
+function noteViewport(renderer: LodRenderer, camera: Camera): void {
+  _notedCamera = camera;
+  const target = renderer.getRenderTarget();
+  const height = target !== null ? target.height : renderer.getDrawingBufferSize(_v2).y;
+  if (camera !== _heightCamera || height !== _height) {
+    _heightCamera = camera;
+    _height = height;
+    _heights.set(camera, height);
+  }
 }
 
 /** Height to assume before the first render told us the real one. */
@@ -380,8 +346,6 @@ export class MeshletMesh extends Object3D {
   private readonly newSlots: Int32Array;
   private readonly marks: Int32Array;
   private readonly shadowCameras = new WeakSet<Camera>();
-  /** Height of what each camera was last seen rendering to. */
-  private readonly heights = new WeakMap<Camera, number>();
   private _batched: BatchedMesh;
   /** Zero-copy buffers wrapping the MeshletData arrays, shared by every draw mesh. */
   private readonly sharedAttributes: Array<{ name: string; attribute: BufferAttribute }>;
@@ -392,9 +356,6 @@ export class MeshletMesh extends Object3D {
    */
   private retired: Array<() => void> = [];
   private retireTimer: ReturnType<typeof setTimeout> | null = null;
-  /** The height last noted, and the camera it was noted for. */
-  private mainHeight = 0;
-  private heightCamera: Camera | null = null;
 
   // ---- instances
   private _count = 0;
@@ -465,8 +426,6 @@ export class MeshletMesh extends Object3D {
   private readonly unseen: LevelBucket[] = [];
   /** In the scene, behind the draw meshes, only while there are `unseen` levels to bring back. */
   private readonly afterDrawMeshes: AfterDrawMeshes;
-  /** The camera whose viewport has been noted since the last update. */
-  private notedCamera: Camera | null = null;
   /** The camera of the last update, when that was the renderer's own call for the render it was starting. */
   private autoCamera: Camera | null = null;
 
@@ -763,8 +722,8 @@ export class MeshletMesh extends Object3D {
       if (this.lodCamera !== null) lodCamera = this.lodCamera;
       height =
         this.viewportHeight ??
-        (camera === this.heightCamera ? this.mainHeight : this.heights.get(camera)) ??
-        (this.mainHeight > 0 ? this.mainHeight : defaultViewportHeight());
+        (camera === _heightCamera ? _height : _heights.get(camera)) ??
+        (_height > 0 ? _height : defaultViewportHeight());
     } else {
       height = viewportHeight;
     }
@@ -780,7 +739,7 @@ export class MeshletMesh extends Object3D {
     }
 
     if (this.unseen.length > 0) this.showLevels(); // (left by a scene walk that did not finish)
-    this.notedCamera = null;
+    _notedCamera = null;
     this.autoCamera = automatic ? camera : null;
 
     const ortho = (lodCamera as { isOrthographicCamera?: boolean }).isOrthographicCamera === true;
@@ -1025,6 +984,9 @@ export class MeshletMesh extends Object3D {
     bm.frustumCulled = false;
     bm.perObjectFrustumCulled = true;
     bm.sortObjects = false;
+    // WebGLRenderer before r181 asks a BatchedMesh for `colorTexture`, which it does not have, takes
+    // the answer to mean its colours have changed, and works out its program again every frame
+    (bm as unknown as { colorTexture: unknown }).colorTexture = null;
     this.place(bm);
     this.installHooks(bm);
     return bm;
@@ -1071,6 +1033,7 @@ export class MeshletMesh extends Object3D {
       this.add(next);
     }
     this._batched = next;
+    (next as unknown as { colorTexture: unknown; _colorsTexture: unknown }).colorTexture = (next as unknown as { _colorsTexture: unknown })._colorsTexture;
 
     // The old mesh may still be drawn by the render in progress (it shows the previous cut for that frame).
     this.retire(() => this.disposeBatchedKeepingBuffers(old));
@@ -1123,10 +1086,8 @@ export class MeshletMesh extends Object3D {
     // cameras belong to lights (WebGPURenderer renders a shadow map as a render of its own, with
     // the light's camera, and calls onBeforeRender in it too).
     batched.onBeforeRender = (renderer, scene, camera, geometry, material, group) => {
-      if (this.notedCamera !== camera && !shadowCameras.has(camera)) {
-        this.notedCamera = camera;
-        this.noteViewport(renderer, camera);
-      }
+      if (LEVELS_NEED_CHECK && (renderer as LodRenderer).isWebGPURenderer === true) this.levelsBlocked = true;
+      if (_notedCamera !== camera && !shadowCameras.has(camera)) noteViewport(renderer, camera);
       BatchedMesh.prototype.onBeforeRender.call(batched, renderer, scene, camera, geometry, material, group);
     };
     batched.onBeforeShadow = (renderer, object, camera, shadowCamera, geometry, depthMaterial, group) => {
@@ -1144,19 +1105,6 @@ export class MeshletMesh extends Object3D {
         hit.object = this;
       }
     };
-  }
-
-  /** Remembers the height of what `camera` renders to, for the automatic update of the next frame. */
-  private noteViewport(renderer: LodRenderer, camera: Camera): void {
-    const target = renderer.getRenderTarget();
-    const height = target !== null ? target.height : renderer.getDrawingBufferSize(_v2).y;
-    if (camera !== this.heightCamera || height !== this.mainHeight) {
-      this.heightCamera = camera;
-      this.heights.set(camera, height);
-    }
-    this.mainHeight = height;
-    // the next update moves every instance to the cluster tier
-    if (THREE_REVISION < WEBGPU_LEVELS_REVISION && renderer.isWebGPURenderer === true) this.levelsBlocked = true;
   }
 
   /** WebGPURenderer renders shadow maps as renders of the scene with a shadow material as override. */
@@ -1698,10 +1646,8 @@ export class MeshletMesh extends Object3D {
     // shadows (what is outside the view still casts shadows into it) and for everything else.
     mesh.onBeforeRender = (renderer, _scene, camera) => {
       if (b.inShadow || (camera !== this.autoCamera && shadowCameras.has(camera))) return;
-      if (this.notedCamera !== camera) {
-        this.notedCamera = camera;
-        this.noteViewport(renderer, camera);
-      }
+      if (LEVELS_NEED_CHECK && (renderer as LodRenderer).isWebGPURenderer === true) this.levelsBlocked = true;
+      if (_notedCamera !== camera) noteViewport(renderer, camera);
       mesh.count = this.culledFor(camera) ? b.visible : b.count;
     };
     mesh.onAfterRender = () => {
@@ -1819,30 +1765,7 @@ export class MeshletMesh extends Object3D {
    * convention). Returns false for a degenerate projection.
    */
   private frustumPlanes(camera: Camera, out: Float64Array): boolean {
-    if (!viewPlanes(camera)) return false;
-    const w = _viewPlanes;
-    if (this.worldIdentity) {
-      for (let j = 0; j < PLANE_FLOATS; j++) out[j] = w[j];
-      return true;
-    }
-    // a point x of this object is at M x in the world, so a world plane (n, d) is (M^T n, n.t + d) here
-    const m = this.matrixWorld.elements;
-    for (let o = 0; o < PLANE_FLOATS; o += 4) {
-      const nx = w[o];
-      const ny = w[o + 1];
-      const nz = w[o + 2];
-      const x = m[0] * nx + m[1] * ny + m[2] * nz;
-      const y = m[4] * nx + m[5] * ny + m[6] * nz;
-      const z = m[8] * nx + m[9] * ny + m[10] * nz;
-      // unit normals again, so a plane value is a distance in the units of this object
-      const length = Math.sqrt(x * x + y * y + z * z);
-      if (!(length > 0) || !Number.isFinite(length)) return false;
-      out[o] = x / length;
-      out[o + 1] = y / length;
-      out[o + 2] = z / length;
-      out[o + 3] = (m[12] * nx + m[13] * ny + m[14] * nz + w[o + 3]) / length;
-    }
-    return true;
+    return frustumPlanesIn(camera, this.matrixWorld.elements, this.worldIdentity, out);
   }
 
   /**
@@ -1960,6 +1883,7 @@ export class MeshletMesh extends Object3D {
         _color.setRGB(this.colors[i * 3], this.colors[i * 3 + 1], this.colors[i * 3 + 2]);
     }
     this._batched.setColorAt(slot, _color);
+    (this._batched as unknown as { colorTexture: unknown; _colorsTexture: unknown }).colorTexture = (this._batched as unknown as { _colorsTexture: unknown })._colorsTexture;
   }
 
   /** Color of instance `i` when it is drawn at a whole-mesh level (`"cluster"` colours are not drawn by level). */

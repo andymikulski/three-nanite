@@ -13,6 +13,7 @@ import type { MeshletBuffers } from "meshoptimizer/clusterizer";
 import { MeshoptSimplifier } from "meshoptimizer/simplifier";
 import type { SimplifierFlags } from "meshoptimizer/simplifier";
 import type { MeshletAttribute, MeshletData, MeshletInput, TypedArray } from "../types.js";
+import { AppearanceCheck, type ColorMap } from "./appearance.js";
 import { partitionClusters } from "./partition.js";
 
 export interface BuildMeshletsOptions {
@@ -35,15 +36,35 @@ export interface BuildMeshletsOptions {
   /** Additive weight of the current simplification error. Default 0. */
   errorMergeAdditive?: number;
   /**
-   * When a group cannot be simplified to its target with the protected seams intact, simplify it
-   * again letting collapses cross them, and keep that if it gets further. Each protected attribute
-   * then counts towards the error with a weight of at least 1, so seams are crossed where it costs
-   * least. This is what lets meshes whose every edge is a seam simplify at all: low-poly models
-   * textured from an atlas, anything with a lightmap layout in a second uv set. Default true.
+   * The base colour texture of the mesh. With it every simplification step is also judged by what
+   * it changes TO THE EYE: the group is drawn before and after, small and from all sides, and a
+   * region that has changed colour counts as an error of its own size, so the step waits until
+   * that region is about a pixel across.
+   *
+   * The simplifier's own error is how far the surface moves, and that alone lets through steps
+   * that move it very little and repaint a lot: the raised rim of a flat roof closing over its
+   * floor, a panel sinking into the wall behind it, a face taking its neighbour's texture across a
+   * seam. Models that get their colours from a palette or an atlas are full of these; give them
+   * this. It costs build time (about twice, for a mesh whose groups are not one colour) and
+   * nothing at run time. `alphaTest` in it makes the holes of a cut-out count as holes.
+   */
+  colorMap?: ColorMap;
+  /**
+   * As `colorMap`, for a mesh that is coloured by its `color` attribute (a material with
+   * `vertexColors`): steps are judged by those colours, and their seams are protected like those
+   * of a uv set. Default false. Ignored when `colorMap` is given.
+   */
+  vertexColors?: boolean;
+  /**
+   * When a group gets nowhere with the protected seams intact, simplify it again letting collapses
+   * cross them. Each protected attribute then counts towards the error with a weight of at least 1,
+   * so seams are crossed where it costs least. This is what lets meshes whose every edge is a seam
+   * simplify at all: low-poly models textured from an atlas, anything with a lightmap layout in a
+   * second uv set. Default true.
    */
   fallbackUnprotected?: boolean;
   /**
-   * Use sloppy simplification when regular simplification gets stuck (after `fallbackUnprotected`).
+   * Use sloppy simplification when a group gets nowhere any other way (after `fallbackUnprotected`).
    * It ignores topology and seams altogether and is the last resort. Default true.
    */
   fallbackSloppy?: boolean;
@@ -221,7 +242,9 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
   // position-only remap: vertices with the same position map to the same canonical id
   const remap = MeshoptSimplifier.generatePositionRemap(positions, 3);
   const locks = new Uint8Array(vertexCount);
-  const protectAttributes = options.protectAttributes ?? ["uv", "uv1", "uv2", "uv3"];
+  const useVertexColors = options.vertexColors === true && !options.colorMap;
+  const protectAttributes = options.protectAttributes ?? (useVertexColors ? ["uv", "uv1", "uv2", "uv3", "color"] : ["uv", "uv1", "uv2", "uv3"]);
+  const appearance = options.colorMap || useVertexColors ? AppearanceCheck.create(attributes, options.colorMap) : null;
   const seam = seamTest(attributes, protectAttributes);
   if (seam) for (let i = 0; i < vertexCount; i++) if (remap[i] !== i && seam(i, remap[i])) locks[i] |= PROTECT;
   // user locks, per position (canonical vertex)
@@ -347,9 +370,12 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
         simpAttrs,
         flags,
         targetSize,
+        Math.floor(merged.length * simplifyThreshold),
         fallbackSloppy,
         sloppyErrorFactor,
         errorEdgeLimit,
+        appearance,
+        vertices.origin,
       );
 
       if (sres.indices.length > merged.length * simplifyThreshold) {
@@ -1259,6 +1285,32 @@ interface SimplifyResult {
   error: number;
 }
 
+/** A group is as good as simplified to its target when it is this close to it. */
+const NEAR_TARGET = 1.1;
+/** A step that goes further is worth an error this many times that of the most careful one. */
+const WORTH = 2;
+
+/** Of two ways of simplifying a group, the one to keep (`stuckSize`: above it a result got nowhere). */
+function better(a: SimplifyResult, b: SimplifyResult, stuckSize: number): SimplifyResult {
+  const small = a.indices.length <= b.indices.length ? a : b;
+  const large = small === a ? b : a;
+  // the one that goes further, unless only the other gets anywhere or it costs out of proportion
+  if (large.indices.length > stuckSize) return small;
+  return small.error <= large.error * WORTH ? small : large;
+}
+
+/**
+ * Simplifies a group towards `targetSize` indices, trying ever less careful ways until one gets
+ * there, and keeping the one that goes furthest for an error in proportion (`better`):
+ *
+ *  1. every seam of the mesh is kept (hard edges, uv seams, whatever the index buffer separates);
+ *  2. only the seams of the protected attributes are kept;
+ *  3. no seam is kept (`fallbackUnprotected`);
+ *  4. topology is not kept either (`fallbackSloppy`), when nothing else got anywhere.
+ *
+ * The error of each is the simplifier's or, when there is something to go by (`appearance`), the
+ * size of what it changes to the eye, whichever is larger.
+ */
 function simplifyLocal(
   scratch: GroupScratch,
   localCount: number,
@@ -1266,15 +1318,26 @@ function simplifyLocal(
   attrs: SimplifyAttributes,
   flags: SimplifierFlags[],
   targetSize: number,
+  stuckSize: number,
   fallbackSloppy: boolean,
   sloppyErrorFactor: number,
   errorEdgeLimit: number,
+  appearance: AppearanceCheck | null,
+  origin: Uint32Array,
 ): SimplifyResult {
   const localIndices = scratch.indices;
   const localLocks = scratch.locks.subarray(0, localCount);
   const localAttrs = scratch.attributes.subarray(0, localCount * attrs.stride);
 
-  let [result, error] = MeshoptSimplifier.simplifyWithAttributes(
+  const localToGlobal = scratch.localToGlobal;
+  const seen = appearance !== null && appearance.prepare(localIndices, localPositions, localCount, (l) => origin[localToGlobal[l]]);
+  const judged = (indices: Uint32Array, error: number): SimplifyResult => ({
+    indices,
+    error: seen ? Math.max(error, appearance!.error(indices, error)) : error,
+  });
+
+  const strict = flags.filter((f) => f !== "Permissive");
+  let [found, foundError] = MeshoptSimplifier.simplifyWithAttributes(
     localIndices,
     localPositions,
     3,
@@ -1284,43 +1347,58 @@ function simplifyLocal(
     localLocks,
     targetSize,
     FLT_MAX,
-    flags,
+    strict,
   );
+  let best = judged(found, foundError);
 
-  // stuck on protected seams: cross them, at the price of the attribute error that costs
-  if (result.length > targetSize && attrs.seamWeights !== null) {
-    let anyProtected = false;
-    const open = scratch.unprotected(localCount);
-    for (let l = 0; l < localCount; l++) {
-      if ((localLocks[l] & PROTECT) !== 0) anyProtected = true;
-      open[l] = localLocks[l] & ~PROTECT;
-    }
-    if (anyProtected) {
-      const [crossed, crossedError] = MeshoptSimplifier.simplifyWithAttributes(
-        localIndices,
-        localPositions,
-        3,
-        localAttrs,
-        attrs.stride,
-        attrs.seamWeights,
-        open,
-        targetSize,
-        FLT_MAX,
-        flags,
-      );
-      if (crossed.length < result.length) {
-        result = crossed;
-        error = crossedError;
+  if (best.indices.length > targetSize * NEAR_TARGET) {
+    [found, foundError] = MeshoptSimplifier.simplifyWithAttributes(
+      localIndices,
+      localPositions,
+      3,
+      localAttrs,
+      attrs.stride,
+      attrs.weights,
+      localLocks,
+      targetSize,
+      FLT_MAX,
+      flags,
+    );
+    best = better(best, judged(found, foundError), stuckSize);
+
+    // across the protected seams too, at the price of the attribute error that costs
+    if (best.indices.length > targetSize * NEAR_TARGET && attrs.seamWeights !== null) {
+      let anyProtected = false;
+      const open = scratch.unprotected(localCount);
+      for (let l = 0; l < localCount; l++) {
+        if ((localLocks[l] & PROTECT) !== 0) anyProtected = true;
+        open[l] = localLocks[l] & ~PROTECT;
+      }
+      if (anyProtected) {
+        [found, foundError] = MeshoptSimplifier.simplifyWithAttributes(
+          localIndices,
+          localPositions,
+          3,
+          localAttrs,
+          attrs.stride,
+          attrs.seamWeights,
+          open,
+          targetSize,
+          FLT_MAX,
+          flags,
+        );
+        best = better(best, judged(found, foundError), stuckSize);
       }
     }
-  }
 
-  // sloppy returns a relative error; scale to absolute
-  if (result.length > targetSize && fallbackSloppy) {
-    const [sloppy, relError] = MeshoptSimplifier.simplifySloppy(localIndices, localPositions, 3, localLocks, targetSize, FLT_MAX);
-    result = sloppy;
-    error = relError * MeshoptSimplifier.getScale(localPositions, 3) * sloppyErrorFactor;
+    // sloppy returns a relative error; scale to absolute
+    if (best.indices.length > stuckSize && fallbackSloppy) {
+      const [sloppy, relError] = MeshoptSimplifier.simplifySloppy(localIndices, localPositions, 3, localLocks, targetSize, FLT_MAX);
+      best = better(best, judged(sloppy, relError * MeshoptSimplifier.getScale(localPositions, 3) * sloppyErrorFactor), stuckSize);
+    }
   }
+  let result = best.indices;
+  let error = best.error;
 
   // never emit an empty group: it would break DAG invariants
   if (result.length === 0) result = localIndices.slice(0, 3);

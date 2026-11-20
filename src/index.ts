@@ -11,6 +11,7 @@ export {
   type MeshletMeshOptions,
   type MeshletMeshStats,
 } from "./three/MeshletMesh.js";
+export { MeshletBatch, type MeshletBatchOptions, type MeshletBatchStats } from "./three/MeshletBatch.js";
 
 // static LODs and geometry conversion
 export { createLodChain, createLodGeometry, geometryToMeshletInput, getLodErrors } from "./three/geometry.js";

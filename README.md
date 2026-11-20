@@ -5,6 +5,7 @@ Nanite-style cluster LOD for three.js: a mesh is split into small clusters ("mes
 - Works with **`WebGLRenderer` and `WebGPURenderer`** (WebGPU back-end and its WebGL 2 fallback), same code path for both.
 - Works with **any standard material** (`MeshStandardMaterial`, node materials, `onBeforeCompile` hooks), including shadows, fog and vertex attributes such as `uv1` or `color`.
 - **Instancing built in**: one `MeshletMesh` draws many copies, each with its own level of detail. Copies that need one detail level throughout, which is every copy more than a few radii away and every copy of a small model, are drawn with real instancing: one draw per level in use, however many copies there are. Only the copies the camera is close to get a cut of their own.
+- **Many different models, one draw call**: `MeshletBatch` draws every model that shares a material, each with its levels and any number of copies, as a single draw. A city of 700 different models in 59 materials is 60 draw calls, at a third to a quarter of the frame time of one `InstancedMesh` per model.
 - **Small models are not penalised**: thousands of copies of a 300 triangle fern are a handful of instanced draws, in effect an `InstancedMesh` with levels of detail and per-instance frustum culling.
 - **Bake offline, load at runtime**: the hierarchy is plain typed arrays with a zero-copy binary format. The runtime entry point has no WebAssembly and no dependency besides three.
 - Vertex data is **shared by all detail levels** (simplification does not create vertices), so the cost over the original mesh is roughly a second index buffer.
@@ -106,6 +107,8 @@ It behaves like an `InstancedMesh`:
 
 Raycasting works through `raycaster.intersectObject(mesh, true)`: hits report `object === mesh` and `instanceId`, and test the detail level currently drawn.
 
+*Use it for a model the camera gets close to that is large enough to need different detail in different places, and for a scene of few kinds of model. For many kinds, see `MeshletBatch` below.*
+
 Things worth knowing:
 
 - **Two ways of drawing an instance**, chosen per instance on every update. *By level*: an instance that needs one detail level throughout is drawn at one of the mesh's whole-mesh levels, and all instances on a level are one `InstancedMesh`: one draw. An instance at least `levelDistance` radii away takes its level from its distance alone, without its hierarchy being walked; a nearer one takes a level when its cut turns out to be one, which for small models is always. *By cluster*: an instance close enough to need different detail in different places gets its own cut of the DAG, drawn through a `BatchedMesh`, a draw per run of clusters. `instancedLevels: false` draws everything by cluster.
@@ -118,6 +121,37 @@ Things worth knowing:
 - **Materials** are drawn through both `BatchedMesh` and `InstancedMesh`. Standard and node materials handle both by themselves; a material that patches shaders with `onBeforeCompile` must work with three's batching chunks and with `instanceMatrix`.
 - **Per-instance data** beyond matrix and color has no slot of its own.
 - **`WebGPURenderer` before r187** binds the buffers of an `InstancedMesh` in ways that do not survive the instance count changing between passes. `MeshletMesh` notices and draws every instance by cluster on that renderer with those versions, as it did before there were levels. `WebGLRenderer` has no such limit.
+
+#### `MeshletBatch`
+
+```ts
+const batch = new MeshletBatch([dataA, dataB, ...], material, {
+  maxInstances?, errorThreshold?, drawCost?, cullInstances?, maxLevels?,
+});
+const id = batch.addInstance(meshIndex, matrix);   // any number, of any of the meshes
+scene.add(batch);
+```
+
+A `MeshletMesh` is one model, and every level of it in use is a draw call. That is right for a few kinds of model with many copies; a scene of hundreds of kinds is then hundreds of draw calls whatever the models cost, and on the web a draw call costs microseconds of script: such a scene is bound by its draw calls long before its triangles. A `MeshletBatch` holds every model that shares a material. Each frame it chooses a level for every instance, sorts the instances by model and level, and draws all of them at once: one draw call a material.
+
+| Member | |
+| --- | --- |
+| `addInstance(mesh, matrix?)` | Adds an instance of `meshes[mesh]`; returns its id. Capacity grows by itself (`maxInstances` avoids the rebuilds). |
+| `setMatrixAt(i, matrix)` / `getMatrixAt`, `getMeshAt(i)`, `setVisibleAt(i, visible)` / `getVisibleAt` | Per instance. |
+| `errorThreshold`, `autoUpdate`, `lodCamera`, `viewportHeight`, `cullInstances`, `update(camera, viewportHeight?)` | As on `MeshletMesh`. |
+| `drawCost` | As on `MeshletMesh`, for a sub-draw, which costs far less than a draw call: default 512. |
+| `getLevelAt(i)`, `getTriangleCountAt(i)`, `levels`, `stats` | `stats`: `{ meshes, instances, visible, draws, triangles, trianglesAll, lastUpdateMs, lastSelected }`; `draws` are sub-draws of the one draw call. |
+| `material`, `castShadow`, `receiveShadow`, `renderOrder`, `layers` | Those of the draw object. |
+| `batched`, `dispose()` | The `THREE.BatchedMesh` that is drawn (replaced when capacity grows). |
+
+Things worth knowing:
+
+- **All meshes of a batch need the same vertex attributes.** Build them with the same `attributes` option.
+- **An instance is drawn at one level throughout**, the one its nearest part needs. That is what a model small against the scene needs anyway. A model the camera walks up to and that is large enough to want coarse far ends stays finer than necessary here; put that one in a `MeshletMesh`.
+- **How it is drawn.** On `WebGLRenderer`: one `multiDrawElementsInstancedWEBGL` call, a sub-draw per model and level in use with its instances (where a browser lacks `WEBGL_multi_draw`, which today is Firefox, an instanced draw per sub-draw, still without three's cost per object). On `WebGPURenderer`: one render object with a `drawIndexed` per model and level, which is how r187 draws a `BatchedMesh`; it needs r187 or newer there. Instance matrices are in a texture and found through a list of instance ids in draw order, so an instance that changes level or leaves the view costs four bytes of upload, and one that does neither costs nothing.
+- **This one is not built on public API alone.** The draw object is a stock `BatchedMesh`, so materials, lights and shadows are three's own; but the batch fills in the draw lists and the id texture `BatchedMesh` keeps for itself, and on `WebGLRenderer` it issues the draw call itself right after three has set everything up for one (three has no instanced multi-draw there). It is checked against r170, r180 and r187; a later three may need it adjusted.
+- **Your material is not modified.** `WebGLRenderer` gets a material derived from it (it reads everything from yours, live) with the batch's matrix lookup in place of three's, and depth materials to match for shadows.
+- **Not supported**: per-instance colours, wireframe, and transparent double-sided materials drawn in two passes. Instances are not sorted by depth, which a transparent material would need.
 
 #### `serializeMeshlets` options
 
@@ -155,9 +189,12 @@ The defaults follow meshoptimizer's `clodDefaultConfig(128)`. The options most l
 | Option | Default | |
 | --- | --- | --- |
 | `maxTriangles` | 128 | Cluster size. Smaller clusters give finer-grained LOD and more draws. |
+| `material` | none | `buildMeshletsFromGeometry` only: the material the geometry is drawn with. Its `map` (and `alphaTest`) becomes `colorMap`, or `vertexColors` is set for a vertex-coloured material without a map. **Pass it for any model that takes its colours from a palette or an atlas**; see "Judging levels by eye" below. |
+| `colorMap` | none | The base colour texture as pixels: `{ data, width, height, flipY?, repeat?, offset?, alphaTest? }` (RGBA bytes, rows from the top). What `material` fills in; give it yourself where there is no canvas to read a texture with (Node), from a decoded PNG. `colorMapFromMaterial(material)` makes one in a browser. |
+| `vertexColors` | `false` | The mesh is coloured by its `color` attribute: levels are judged by those colours and their seams are protected. |
 | `attributeWeights` | `{ normal: 0.5 }` | How strongly each attribute resists simplification. Add `color` or `uv` if they carry important detail. |
 | `protectAttributes` | `["uv", "uv1", "uv2", "uv3"]` | Attributes whose seams are preserved as long as the mesh can be simplified with them intact. |
-| `fallbackUnprotected` | `true` | When a group cannot reach its target with the protected seams intact, simplify it again letting collapses cross them, each protected attribute counting towards the error with a weight of at least 1. This is what lets a mesh whose every edge is a seam simplify at all: low-poly models textured from an atlas, anything with a lightmap layout in a second uv set. |
+| `fallbackUnprotected` | `true` | When a group gets nowhere near its target with the protected seams intact, simplify it again letting collapses cross them, each protected attribute counting towards the error with a weight of at least 1. This is what lets a mesh whose every edge is a seam simplify at all: low-poly models textured from an atlas, anything with a lightmap layout in a second uv set. |
 | `fallbackSloppy` | `true` | The last resort after that: sloppy simplification, which ignores topology and seams altogether. |
 | `dilateBorders` | `false` | Makes up for the area a step removes at open borders (loose pieces such as leaf cards can only be simplified by removing them) by growing the pieces that are left, so every level covers what the level before covered. Adds vertices. See "Foliage" below for when to use it. |
 | `attributes` | all | Which attributes to bake (`buildMeshletsFromGeometry` only). |
@@ -165,6 +202,14 @@ The defaults follow meshoptimizer's `clodDefaultConfig(128)`. The options most l
 | `coarsestTriangles` | 8 | The last cluster keeps being simplified, a level a step, until it has at most this many triangles, so a far instance costs a handful of triangles and not most of a cluster. `Infinity` stops at one cluster, as clusterlod does. |
 | `errorEdgeLimit` | 0 (off) | Caps the error of a step at this many times the edge length of the triangles it simplified (clusterlod's `simplify_error_edge_limit`). For dense surfaces whose attribute error is out of proportion; not for foliage made of loose cards, where every level gets the same cap. |
 | `onProgress` | | Called once per level. |
+
+#### Judging levels by eye
+
+A simplifier measures how far it moves the surface. That is not the same as how much it changes what is seen. The roof of a low-poly building is a dark floor inside a raised rim of the wall's colour; closing the rim over the floor moves the surface by the depth of the recess, a few centimetres, and turns the whole roof from dark to the colour of the walls. Panels a hand above a wall, markings just above a road, a face that takes its neighbour's patch of a palette texture: all cheap by the geometric measure and plain to see, as patches that flicker between two colours where copies switch level.
+
+With `material` (or `colorMap`) the builder checks. Each group is drawn before and after a step, 40 pixels across and from ten directions, in its base colour; what differs and is not explained by the surface having moved as far as the geometric error says is a changed region, and the step's error is at least the size of that region. So such a step is still taken, and waits until the region is about a pixel across. Of the ways to simplify a group (keeping every seam, keeping the seams of the protected attributes, keeping none, sloppy) the builder takes the one that goes furthest for an error in proportion, which for these models means the careful ones first.
+
+On a city of 491 low-poly models this took the pixels that change colour as a level comes in, measured per model at the worst level, from 376 on average to 3, and the models with more than 100 such pixels from 14 to none. It costs build time (four to five times for these models; a group that is one colour throughout is not checked) and triangles where the old levels were wrong (20% more drawn in that city), and nothing at run time. Without a material nothing changes except the order the ways are tried in.
 
 The builder is deterministic and does not modify or copy the vertex arrays: the result references the arrays you passed in (unless `dilateBorders` added vertices, in which case the result has arrays of its own that begin with yours).
 
@@ -229,7 +274,7 @@ Leaf cards and other loose pieces with open borders cannot be simplified, only r
 
 Guidance on where it pays off:
 
-- **Count the draws before the triangles.** A city of 15,700 placements of 700 different low-poly meshes (768 mesh and material pairs, 4.8 million triangles; desktop GPU, `WebGLRenderer`) takes 12 to 34 ms a frame as one `Mesh` per placement, because it is 2,600 to 15,900 draw calls. As one `InstancedMesh` per pair it takes 1.2 to 2.0 ms, and as one `MeshletMesh` per pair 1.7 to 2.6 ms, with 4 to 8 times fewer triangles (0.6 to 1.1 million) and, from inside the city, fewer draws than the `InstancedMesh`es, which are drawn whole whenever any copy is in view. On that GPU the triangles were never the cost, so plain instancing is ahead by the bookkeeping; where triangles are the cost (a slower GPU, heavier materials, more shadow maps) the order turns round. Either way the step that matters is the first one: get the placements into instances.
+- **Count the draws before the triangles.** A city of 15,700 placements of 700 different low-poly meshes (768 mesh and material pairs, 4.8 million triangles; desktop GPU, `WebGLRenderer`) takes 12 to 34 ms a frame as one `Mesh` per placement, because it is 2,600 to 15,900 draw calls. As one `InstancedMesh` per pair it takes 1.1 to 2.2 ms (500 to 770 draw calls), and as one `MeshletMesh` per pair 1.4 to 3.1 ms: 4 to 8 times fewer triangles, about as many draw calls, and the bookkeeping on top. On that GPU the triangles were never the cost; the draw calls are. As one `MeshletBatch` per material, 60 draw calls for all of it, it takes 0.45 to 0.55 ms (1.1 ms with a shadow map, where the `InstancedMesh`es take 3.0), and on `WebGPURenderer` 0.75 ms against 1.9. So: get the placements into instances first, and where there are many kinds of model, into batches.
 
 - It needs triangles to remove. A model of a few hundred triangles has levels too, but they only show once it is some 30 pixels tall; what such a model gains is instancing with per-instance levels and culling, not fewer triangles up close.
 - The error is geometric and the budget is in pixels, so a low-poly model, whose triangles are many pixels large, keeps all of them until it is small on screen. That is by design: nothing visible is given up at one pixel. Raise `errorThreshold` where that is more than the scene needs.
@@ -249,7 +294,7 @@ Because group boundaries are locked while a group is simplified, a group can be 
 
 At runtime a cut is found by walking the DAG from the coarsest groups, descending only where the error projected on screen exceeds `errorThreshold`. The distance to a group is never taken smaller than the distance to the mesh itself: group spheres only grow up the DAG and end up well outside the mesh, which would otherwise refine a mesh seen from outside as if the camera were much nearer (up to twice the triangles at two to three radii).
 
-Most instances never need that walk. Seen from a few radii away an object needs one detail level throughout, and then its cut is one of a small fixed family: the cuts of a single error, which only change where that error crosses a group's. `MeshletMesh` lists them (the *whole-mesh levels*, 48 at most), finds the level of a far instance by a binary search on its distance, and draws all instances on a level with one stock `THREE.InstancedMesh` over a range of the shared index buffer. Instances whose cut does mix levels are drawn through a stock `THREE.BatchedMesh` in which every run of clusters is registered as an index range. Both use only public three.js API and share one set of vertex buffers, so three keeps ownership of all renderer-specific code.
+Most instances never need that walk. Seen from a few radii away an object needs one detail level throughout, and then its cut is one of a small fixed family: the cuts of a single error, which only change where that error crosses a group's. `MeshletMesh` lists them (the *whole-mesh levels*, 48 at most), finds the level of a far instance by a binary search on its distance, and draws all instances on a level with one stock `THREE.InstancedMesh` over a range of the shared index buffer. Instances whose cut does mix levels are drawn through a stock `THREE.BatchedMesh` in which every run of clusters is registered as an index range. Both use only public three.js API and share one set of vertex buffers, so three keeps ownership of all renderer-specific code. (`MeshletBatch` is the exception: see its notes.)
 
 Which instances are looked at each frame is kept small as well. An instance's level holds between two distances, so it is given the length of camera travel after which it could first be another (the nearer of the two, less a margin); until the camera has come that far, measured along its path, the instance is skipped, and a mesh none of whose instances is due is skipped as a whole. The levels in use are then chosen to cost least, a draw being worth `drawCost` triangles: the levels asked for, in order, are cut into runs that are each drawn at their finest level, with the cuts where draws plus triangles are fewest (a small dynamic program over at most 48 levels).
 
