@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>three-nanite: the valley</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #9cc8e8; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      canvas { display: block; touch-action: none; }
+      #hud { position: fixed; left: 12px; top: 12px; margin: 0; padding: 10px 12px; color: #f4f1e8; background: rgba(20, 28, 22, 0.62); border-radius: 6px; pointer-events: none; white-space: pre; }
+      #hud b { color: #ffd479; font-weight: 600; }
+      #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #fffdf4; font-size: 15px; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); background: linear-gradient(#7fb6e0, #cfe6b9); }
+      #loading.done { display: none; }
+      #help { position: fixed; left: 12px; bottom: 12px; color: #fffdf4; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6); pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div id="loading">loading</div>
+    <pre id="hud"></pre>
+    <div id="help">drag to look · W A S D move · Q / E down, up · Shift faster · wheel along the view</div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

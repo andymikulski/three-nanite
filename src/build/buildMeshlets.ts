@@ -385,14 +385,18 @@ export async function buildMeshlets(input: MeshletInput, options: BuildMeshletsO
         continue;
       }
 
-      const err = sres.error;
+      let err = sres.error;
+      if (dilator) {
+        // (before the group goes out: the borders it is replaced by may move, and that counts)
+        dilator.dilate(scratch.indices, sres.indices, scratch, localCount, vertices, bounds, seam);
+        // The level that replaces the group is the simplified one with its borders moved: it is as far
+        // from the group as the simplification went, plus how far the borders moved. (Without the
+        // second, a step that thins grass blades and widens what is left to make up for it counts as
+        // a centimetre of error however much wider the blades get, and is used up close.)
+        err += dilator.displacement;
+      }
       bounds.error = Math.fround(Math.max(bounds.error * errorMergePrevious, err) + err * errorMergeAdditive);
-
       const refined = outputGroup(members, bounds, depth);
-
-      // the group is out with its own clusters; what replaces it may now get its borders moved
-      // (new vertices, which the local arrays then stand for)
-      if (dilator) dilator.dilate(scratch.indices, sres.indices, scratch, localCount, vertices, bounds, seam);
 
       // clusterize the simplified group (local ids; map back to global)
       const buffers = MeshoptClusterizer.buildMeshletsFlex(
@@ -833,6 +837,8 @@ class BorderDilator {
   private canonical = new Int32Array(0);
   /** Per local vertex: already replaced by a new vertex. */
   private replaced = new Uint8Array(0);
+  /** How far the last `dilate` moved any border position (0 when it moved none). */
+  displacement = 0;
 
   /**
    * @param box    Box no vertex is moved out of, `[minX, minY, minZ, maxX, maxY, maxZ]`.
@@ -861,6 +867,7 @@ class BorderDilator {
     bounds: Bound,
     seam: ((i: number, r: number) => boolean) | null,
   ): number {
+    this.displacement = 0;
     const positions = scratch.positions;
     const l2g = scratch.localToGlobal;
 
@@ -1021,9 +1028,11 @@ class BorderDilator {
     }
     this.place(count, distance);
 
-    // ---- the group's LOD sphere holds what moved
+    // ---- the group's LOD sphere holds what moved, and how far it moved is an error of the level
     for (let p = 0; p < count; p++) {
       if (moved[p] === 0) continue;
+      const shift = Math.hypot(target[p * 3] - base[p * 3], target[p * 3 + 1] - base[p * 3 + 1], target[p * 3 + 2] - base[p * 3 + 2]);
+      if (shift > this.displacement) this.displacement = shift;
       const dx = target[p * 3] - bounds.x;
       const dy = target[p * 3 + 1] - bounds.y;
       const dz = target[p * 3 + 2] - bounds.z;

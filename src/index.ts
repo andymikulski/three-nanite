@@ -13,6 +13,9 @@ export {
 } from "./three/MeshletMesh.js";
 export { MeshletBatch, type MeshletBatchOptions, type MeshletBatchStats } from "./three/MeshletBatch.js";
 
+// materials: alpha cut-outs that keep their colour and coverage with distance
+export { cutoutMipmaps, prepareCutoutTexture, type MipLevel } from "./three/cutout.js";
+
 // static LODs and geometry conversion
 export { createLodChain, createLodGeometry, geometryToMeshletInput, getLodErrors } from "./three/geometry.js";
 

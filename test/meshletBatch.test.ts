@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
   BufferGeometry,
+  Color,
   Frustum,
   Matrix4,
   MeshBasicMaterial,
@@ -23,6 +24,7 @@ import { buildMeshletsFromGeometry } from "../src/build/index.js";
 import { levelForError, lodScale, MeshletBatch } from "../src/index.js";
 import type { MeshletBatchOptions } from "../src/index.js";
 import type { MeshletData } from "../src/types.js";
+import { LOD_PALETTE } from "../src/three/palette.js";
 
 const H = 1080;
 const BUILD_TIMEOUT = 120000;
@@ -91,6 +93,7 @@ interface Raw {
   drawCounts: Int32Array;
   drawOffsets: Int32Array;
   drawSeen: Int32Array;
+  drawShadow: Int32Array;
   drawAll: Int32Array;
 }
 const raw = (batch: MeshletBatch) => batch as unknown as Raw;
@@ -164,10 +167,10 @@ interface SubDraw {
 }
 
 /** WebGLRenderer: sub-draw `d` draws `counts[d]` instances `T[T[d] + k]`. */
-function readGL(batch: MeshletBatch, which: "seen" | "all"): SubDraw[] {
+function readGL(batch: MeshletBatch, which: "seen" | "shadow" | "all"): SubDraw[] {
   const r = raw(batch);
   const T = batchedRaw(batch)._indirectTexture.image.data;
-  const counts = which === "seen" ? r.drawSeen : r.drawAll;
+  const counts = which === "seen" ? r.drawSeen : which === "shadow" ? r.drawShadow : r.drawAll;
   const out: SubDraw[] = [];
   for (let d = 0; d < r.drawCount; d++) {
     const ids: number[] = [];
@@ -660,7 +663,7 @@ describe("MeshletBatch", () => {
       beforeShadow(batch, gl.renderer, camera, shadowCamera);
       afterShadow(batch, gl.renderer, camera, shadowCamera);
       expect(gl.extension.multiDrawElementsInstancedWEBGL).toHaveBeenCalledTimes(1);
-      expect(gl.extension.multiDrawElementsInstancedWEBGL).toHaveBeenCalledWith(4, r.drawCounts, 0, type, r.drawOffsets, 0, r.drawAll, 0, r.drawCount);
+      expect(gl.extension.multiDrawElementsInstancedWEBGL).toHaveBeenCalledWith(4, r.drawCounts, 0, type, r.drawOffsets, 0, r.drawShadow, 0, r.drawCount);
       expect(gl.renderer.info.render.calls).toBe(2);
     });
 
@@ -1048,5 +1051,153 @@ describe("MeshletBatch", () => {
     before(gpuBatch, makeWebGPU(), camera);
     expect(() => gpuBatch.dispose()).not.toThrow();
     expect(new BufferGeometry()).toBeDefined();
+  });
+
+  it("O. debugColors 'lod' tints every instance by the depth of the level it is drawn at", () => {
+    const colorsOf = (batch: MeshletBatch) => (batch.batched as unknown as { _colorsTexture: { image: { data: Float32Array } } | null })._colorsTexture;
+    const expectTints = (batch: MeshletBatch, lod: boolean) => {
+      const data = colorsOf(batch)!.image.data;
+      for (let i = 0; i < batch.count; i++) {
+        const levels = batch.levels[batch.getMeshAt(i)];
+        const want = lod ? LOD_PALETTE[levels.depth[batch.getLevelAt(i)] % LOD_PALETTE.length] : new Color(1, 1, 1);
+        expect([data[i * 4], data[i * 4 + 1], data[i * 4 + 2]]).toEqual([want.r, want.g, want.b].map(Math.fround));
+      }
+    };
+    for (const renderer of [() => makeWebGL().renderer, makeWebGPU]) {
+      const batch = makeBatch({ drawCost: 0, maxInstances: 8 });
+      scatter(batch);
+      const camera = makeCamera(0, 0, 0);
+      update(batch, camera);
+      before(batch, renderer(), camera);
+      expect(colorsOf(batch)).toBeNull(); // (no colours until asked for)
+
+      const version = (batch.batched.material as MeshStandardMaterial).version;
+      batch.debugColors = "lod";
+      before(batch, renderer(), camera);
+      // (WebGPURenderer only notices the new colour texture through the material)
+      expect((batch.batched.material as MeshStandardMaterial).version).toBeGreaterThan(version);
+      const levels = new Set<number>();
+      for (let i = 0; i < batch.count; i++) levels.add(batch.getLevelAt(i));
+      expect(levels.size).toBeGreaterThanOrEqual(2);
+      expectTints(batch, true);
+
+      // moving away changes levels, and the tints follow
+      const far = makeCamera(0, 0, 400);
+      update(batch, far);
+      before(batch, renderer(), far);
+      expectTints(batch, true);
+
+      // growing makes a new draw object, painted again
+      const k = batch.count;
+      for (let i = 0; i < k; i++) batch.addInstance(i % 2, batch.getMatrixAt(i, new Matrix4()));
+      update(batch, far);
+      before(batch, renderer(), far);
+      expectTints(batch, true);
+
+      batch.debugColors = "none";
+      before(batch, renderer(), far);
+      expectTints(batch, false);
+    }
+  });
+
+  it("O. the derived material looks colours up per instance as it does matrices", () => {
+    const batch = makeBatch({}, new MeshStandardMaterial());
+    const s = { vertexShader: "#include <batching_vertex>\n#include <color_vertex>" };
+    (batch.batched.material as MeshStandardMaterial).onBeforeCompile(s as never, null as never);
+    expect(s.vertexShader).not.toContain("#include <color_vertex>");
+    expect(s.vertexShader).toContain("getBatchingColor( getIndirectIndex( int( getIndirectIndex( gl_DrawID ) ) + gl_InstanceID ) )");
+    expect(s.vertexShader).not.toContain("getBatchingColor( getIndirectIndex( gl_DrawID ) )");
+  });
+
+  describe("P. culling at scale, and shadow passes culled for their camera", () => {
+    /** 600 instances spread over a wide area, so the culling goes by chunks. */
+    function setup() {
+      const batch = makeBatch({ drawCost: 0 });
+      const rand = seeded(0xc0ffee);
+      for (let i = 0; i < 600; i++) {
+        const mesh = i % 2;
+        batch.addInstance(mesh, matrixAt(mesh === 0 ? knot : ball, new Vector3((rand() - 0.5) * 600, (rand() - 0.5) * 20, (rand() - 0.5) * 600)));
+      }
+      const camera = makeCamera(0, 2, 0);
+      camera.lookAt(30, 0, -100);
+      camera.updateMatrixWorld(true);
+      const shadow = new OrthographicCamera(-60, 60, 60, -60, 0.1, 2000);
+      shadow.position.set(150, 300, -100);
+      shadow.lookAt(60, 0, -60);
+      shadow.updateMatrixWorld(true);
+      return { batch, camera, shadow };
+    }
+    const union = (a: number[], b: number[]) => sorted([...new Set([...a, ...b])]);
+
+    it("P. the main pass draws exactly the instances in view", () => {
+      const { batch, camera } = setup();
+      update(batch, camera);
+      const gl = makeWebGL();
+      before(batch, gl.renderer, camera);
+      const expected = expectedInView(batch, camera);
+      expect(expected.length).toBeGreaterThan(20);
+      expect(expected.length).toBeLessThan(batch.count - 100);
+      expect(sorted(readGL(batch, "seen").flatMap((r) => r.ids))).toEqual(expected);
+
+      // a moved instance is culled where it now is
+      const m = new Matrix4();
+      const gone = expected[0];
+      batch.setMatrixAt(gone, matrixAt(batch.meshes[batch.getMeshAt(gone)], new Vector3(0, 0, 400)));
+      const outside = batch.count - 1 - [...Array(batch.count).keys()].reverse().findIndex((i) => !expected.includes(i));
+      batch.getMatrixAt(outside, m);
+      batch.setMatrixAt(outside, matrixAt(batch.meshes[batch.getMeshAt(outside)], new Vector3(3, 2, -10)));
+      update(batch, camera);
+      before(batch, gl.renderer, camera);
+      const now = expectedInView(batch, camera);
+      expect(now).toContain(outside);
+      expect(now).not.toContain(gone);
+      expect(sorted(readGL(batch, "seen").flatMap((r) => r.ids))).toEqual(now);
+    });
+
+    it("P. WebGL: a shadow pass draws the instances in view and those in the shadow camera's", () => {
+      const { batch, camera, shadow } = setup();
+      update(batch, camera);
+      const gl = makeWebGL();
+      beforeShadow(batch, gl.renderer, camera, shadow);
+      afterShadow(batch, gl.renderer, camera, shadow);
+      const r = raw(batch);
+      expect(gl.extension.multiDrawElementsInstancedWEBGL).toHaveBeenLastCalledWith(4, r.drawCounts, 0, expect.any(Number), r.drawOffsets, 0, r.drawShadow, 0, r.drawCount);
+      const main = expectedInView(batch, camera);
+      const lit = expectedInView(batch, shadow);
+      expect(lit.filter((i) => !main.includes(i)).length).toBeGreaterThan(5);
+      const want = union(main, lit);
+      expect(want.length).toBeLessThan(batch.count - 100);
+      const bpe = (batch.batched.geometry.index!.array as Uint16Array | Uint32Array).BYTES_PER_ELEMENT;
+      const runs = readGL(batch, "shadow");
+      for (const run of runs) expectGroupsRight(batch, [{ ids: run.ids, indexCount: run.indexCount, indexStart: run.offset / bpe }], `shadow sub-draw ${run.d}`);
+      expect(sorted(runs.flatMap((run) => run.ids))).toEqual(want);
+      // the main pass that follows draws the view only
+      before(batch, gl.renderer, camera);
+      after(batch, gl.renderer, camera);
+      expect(sorted(readGL(batch, "seen").flatMap((run) => run.ids))).toEqual(main);
+      // a shadow camera it was not culled for gets everything
+      const other = shadow.clone();
+      other.position.x += 50;
+      other.updateMatrixWorld(true);
+      afterShadow(batch, gl.renderer, camera, other);
+      expect(gl.extension.multiDrawElementsInstancedWEBGL).toHaveBeenLastCalledWith(4, r.drawCounts, 0, expect.any(Number), r.drawOffsets, 0, r.drawAll, 0, r.drawCount);
+    });
+
+    it("P. WebGPU: the same, through the merged draws", () => {
+      const { batch, camera, shadow } = setup();
+      update(batch, camera);
+      const gpu = makeWebGPU();
+      before(batch, gpu, camera);
+      const main = expectedInView(batch, camera);
+      const scene = new Scene();
+      scene.overrideMaterial = { isShadowNodeMaterial: true } as never;
+      beforeShadow(batch, gpu, camera, shadow);
+      before(batch, gpu, shadow, scene);
+      const drawn = readGPU(batch).filter((e) => e.indexCount > 0);
+      expectGroupsRight(batch, drawn, "shadow pass");
+      expect(sorted(drawn.flatMap((e) => e.ids))).toEqual(union(main, expectedInView(batch, shadow)));
+      before(batch, gpu, camera);
+      expect(sorted(readGPU(batch).filter((e) => e.indexCount > 0).flatMap((e) => e.ids))).toEqual(main);
+    });
   });
 });

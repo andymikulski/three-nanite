@@ -3,6 +3,7 @@ import {
   Box3,
   BufferAttribute,
   BufferGeometry,
+  Color,
   Matrix4,
   Mesh,
   MeshDepthMaterial,
@@ -10,6 +11,7 @@ import {
   Object3D,
   REVISION,
   RGBADepthPacking,
+  ShaderChunk,
   Sphere,
   Vector2,
   Vector3,
@@ -19,6 +21,7 @@ import { computeLodLevels, copyLevelIndices, levelForError } from "../core/level
 import type { LodLevels } from "../core/levels.js";
 import { lodScale } from "../core/select.js";
 import type { MeshletData, TypedArray } from "../types.js";
+import { LOD_PALETTE } from "./palette.js";
 import { frustumPlanesIn, PLANE_FLOATS } from "./viewPlanes.js";
 
 /** Construction options of {@link MeshletBatch}. */
@@ -33,7 +36,10 @@ export interface MeshletBatchOptions {
    * far less than a draw call, so the default is low: 512. `0` draws every instance at its own level.
    */
   drawCost?: number;
-  /** Leave instances outside the view out of the main pass (shadow passes draw all of them). Default true. */
+  /**
+   * Leave instances outside the view out of the main pass, and those outside both the view and the
+   * shadow camera's out of a shadow pass. Default true.
+   */
   cullInstances?: boolean;
   /** Most whole-mesh levels kept of each mesh (their index lists are all stored). Default 12. */
   maxLevels?: number;
@@ -88,6 +94,62 @@ const KIND_WEBGPU = 2;
 const DEFAULT_NEAR = 0.1;
 const MIN_SCALE = 1e-20;
 
+/** Instances per chunk of the culling (see `MeshletBatch.buildChunks`). */
+const CHUNK = 64;
+
+/** Spreads the 10 bits of `v` to every third bit (for a Morton code). */
+function spread10(v: number): number {
+  v = (v | (v << 16)) & 0x030000ff;
+  v = (v | (v << 8)) & 0x0300f00f;
+  v = (v | (v << 4)) & 0x030c30c3;
+  v = (v | (v << 2)) & 0x09249249;
+  return v;
+}
+
+/** What a pass draws: the instances in view, those and the ones in the shadow camera's view, or all. */
+const PASS_ALL = 0;
+const PASS_VIEW = 1;
+const PASS_SHADOW = 2;
+
+/**
+ * The two passes of a counting sort of the instances by group and segment (see
+ * `MeshletBatch.layout`): with `order` null, counts the instances of each (group, segment) into
+ * `segments`; with it, places each instance at its (group, segment)'s cursor in `segments`.
+ * (A small function by itself: it is most of the work of a frame with many instances.)
+ */
+function sortInstances(
+  n: number,
+  want: Int32Array,
+  hidden: Uint8Array,
+  inView: Uint8Array,
+  inShadow: Uint8Array,
+  drawn: Int32Array,
+  view: number,
+  shadowing: number,
+  segments: Int32Array,
+  order: Uint32Array | null,
+): void {
+  const notView = view ^ 1;
+  if (order === null) {
+    for (let i = 0; i < n; i++) {
+      const w = want[i];
+      if (w < 0 || hidden[i] === 1) continue;
+      const v = (inView[i] & view) | notView;
+      segments[drawn[w] * 3 + 2 - 2 * v - ((v ^ 1) & inShadow[i] & shadowing)]++;
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const w = want[i];
+      if (w < 0 || hidden[i] === 1) continue;
+      const v = (inView[i] & view) | notView;
+      order[segments[drawn[w] * 3 + 2 - 2 * v - ((v ^ 1) & inShadow[i] & shadowing)]++] = i;
+    }
+  }
+}
+
+const TINT_NONE = -1;
+const TINT_WHITE = -2;
+
 /**
  * How a batch finds the matrix of the instance it is drawing, in place of three's
  * `batching_vertex`: the id texture begins with where the ids of each sub-draw begin, and an
@@ -97,11 +159,21 @@ const INSTANCED_LOOKUP = `#ifdef USE_BATCHING
 	mat4 batchingMatrix = getBatchingMatrix( getIndirectIndex( int( getIndirectIndex( gl_DrawID ) ) + gl_InstanceID ) );
 #endif`;
 
+/** How three's `color_vertex` finds the colour of what it draws (the same in r170 to r187), and the batch's way. */
+const COLOR_LOOKUP = "getBatchingColor( getIndirectIndex( gl_DrawID ) )";
+const INSTANCED_COLOR_LOOKUP = "getBatchingColor( getIndirectIndex( int( getIndirectIndex( gl_DrawID ) ) + gl_InstanceID ) )";
+
+/** Three's `color_vertex` with the batch's colour lookup (used only where the draw object has colours, `debugColors`). */
+function instancedColorVertex(): string {
+  return ShaderChunk.color_vertex.split(COLOR_LOOKUP).join(INSTANCED_COLOR_LOOKUP);
+}
+
 const _m = new Matrix4();
 const _m2 = new Matrix4();
 const _v3 = new Vector3();
 const _v2 = new Vector2();
 const _sphere = new Sphere();
+const _white = new Color(1, 1, 1);
 const _planes = new Float64Array(PLANE_FLOATS);
 const _rayMesh = new Mesh();
 const _hits: Intersection[] = [];
@@ -121,7 +193,9 @@ function withInstancedLookup<T extends Material>(material: T): T {
   derived._listeners = undefined;
   derived.onBeforeCompile = function (this: Material, shader, renderer) {
     material.onBeforeCompile.call(this, shader, renderer);
-    shader.vertexShader = shader.vertexShader.replace("#include <batching_vertex>", INSTANCED_LOOKUP);
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <batching_vertex>", INSTANCED_LOOKUP)
+      .replace("#include <color_vertex>", instancedColorVertex());
   };
   derived.customProgramCacheKey = function (this: Material) {
     return material.customProgramCacheKey.call(this) + "|meshlet batch";
@@ -181,6 +255,7 @@ export class MeshletBatch extends Object3D {
   lodCamera: Camera | null = null;
   /** Height in pixels of what the camera renders to; `null` (default) takes it from the renderer. */
   viewportHeight: number | null = null;
+  private _debugColors: "none" | "lod" = "none";
   /** Sphere around all instances, in the space of this object. */
   readonly boundingSphere = new Sphere();
   /** Live statistics. */
@@ -228,6 +303,10 @@ export class MeshletBatch extends Object3D {
   private instHidden: Uint8Array;
   private instInView: Uint8Array;
   private instDue: Float64Array;
+  /** The tint each instance was last given: a palette entry, TINT_WHITE, or TINT_NONE (the draw object has no colour for it yet). */
+  private instTint: Int16Array;
+  /** Whether colours were ever switched on: until then the draw object has none, and nothing is painted. */
+  private colorsUsed = false;
   private dirty: Uint8Array;
   private dirtyList: Int32Array;
   private dirtyCount = 0;
@@ -260,24 +339,51 @@ export class MeshletBatch extends Object3D {
   private readonly cullKey = new Float64Array(48);
   private cullValid = false;
   private cullStale = false;
+  /** Whether each instance is inside the frustum of the shadow camera last drawn for (see `cullShadow`). */
+  private instInShadow: Uint8Array;
+  private readonly shadowKey = new Float64Array(48);
+  private shadowValid = false;
+  private shadowStale = false;
+  /**
+   * Chunks: the instances in a spatially coherent order (Morton order of their centres), cut into
+   * runs of CHUNK instances, each with a box around its instances' spheres, so a frustum test
+   * decides a whole chunk at once wherever the chunk is inside or outside. Built when instances are
+   * added; a moved instance widens the box of its chunk.
+   */
+  private chunkItems: Int32Array = new Int32Array(0);
+  private chunkBox: Float32Array = new Float32Array(0);
+  private instChunk: Int32Array;
+  private chunkCount = 0;
+  private chunksStale = true;
+  private movedSinceChunks = 0;
 
   // ---- what is drawn: the instance ids in draw order, and a sub-draw per group in use
   private layoutStale = true;
   private order: Uint32Array;
   private readonly groupAll: Int32Array;
   private readonly groupSeen: Int32Array;
+  private readonly groupShadow: Int32Array;
+  /** Per group, instances (then cursors) of each of its three segments (see `layout`). */
+  private readonly segments: Int32Array;
   private readonly groupBase: Int32Array;
   private drawCount = 0;
   private readonly drawGroup: Int32Array;
   private readonly drawCounts: Int32Array;
   private readonly drawOffsets: Int32Array;
+  /** Instances of each sub-draw: in view, in view or in the shadow camera's, all. */
   private readonly drawSeen: Int32Array;
+  private readonly drawShadow: Int32Array;
   private readonly drawAll: Int32Array;
   /** The same for WebGPURenderer: a pass's sub-draws have to step over the instances it leaves out. */
   private readonly seenStarts: Int32Array;
   private readonly seenCounts: Int32Array;
   private readonly seenInstances: Int32Array;
   private seenEntries = 0;
+  private readonly shadowStarts: Int32Array;
+  private readonly shadowCounts: Int32Array;
+  private readonly shadowInstances: Int32Array;
+  private shadowEntries = 0;
+  private shadowTriangles = 0;
   private readonly allStarts: Int32Array;
   private readonly allCounts: Int32Array;
   private readonly allInstances: Int32Array;
@@ -378,15 +484,21 @@ export class MeshletBatch extends Object3D {
     // ---- draw lists
     this.groupAll = new Int32Array(groups);
     this.groupSeen = new Int32Array(groups);
+    this.groupShadow = new Int32Array(groups);
+    this.segments = new Int32Array(groups * 3);
     this.groupBase = new Int32Array(groups);
     this.drawGroup = new Int32Array(groups);
     this.drawCounts = new Int32Array(groups);
     this.drawOffsets = new Int32Array(groups);
     this.drawSeen = new Int32Array(groups);
+    this.drawShadow = new Int32Array(groups);
     this.drawAll = new Int32Array(groups);
     this.seenStarts = new Int32Array(groups * 2);
     this.seenCounts = new Int32Array(groups * 2);
     this.seenInstances = new Int32Array(groups * 2);
+    this.shadowStarts = new Int32Array(groups * 2);
+    this.shadowCounts = new Int32Array(groups * 2);
+    this.shadowInstances = new Int32Array(groups * 2);
     this.allStarts = new Int32Array(groups);
     this.allCounts = new Int32Array(groups);
     this.allInstances = new Int32Array(groups);
@@ -401,7 +513,10 @@ export class MeshletBatch extends Object3D {
     this.instWant = new Int32Array(capacity).fill(-1);
     this.instHidden = new Uint8Array(capacity);
     this.instInView = new Uint8Array(capacity);
+    this.instInShadow = new Uint8Array(capacity);
+    this.instChunk = new Int32Array(capacity);
     this.instDue = new Float64Array(capacity);
+    this.instTint = new Int16Array(capacity).fill(TINT_NONE);
     this.dirty = new Uint8Array(capacity);
     this.dirtyList = new Int32Array(capacity);
     this.order = new Uint32Array(capacity);
@@ -447,6 +562,8 @@ export class MeshletBatch extends Object3D {
     this.instWant[i] = -1;
     this.instHidden[i] = 0;
     this.instInView[i] = 1;
+    this.instInShadow[i] = 1;
+    this.chunksStale = true;
     const id = this._batched.addInstance(0);
     if (id !== i) throw new Error("three-nanite: unexpected BatchedMesh instance id (unsupported three.js version)");
     this.stats.instances = this._count;
@@ -471,6 +588,19 @@ export class MeshletBatch extends Object3D {
     this.instSphere[o + 3] = s[k + 3] * scale;
     this.boundsDirty = true;
     this.cullStale = true;
+    this.shadowStale = true;
+    if (!this.chunksStale) {
+      // (its chunk grows to take it in; after many moves the chunks are made again)
+      const box = this.chunkBox;
+      const b = this.instChunk[i] * 6;
+      const r = this.instSphere[o + 3];
+      for (let a = 0; a < 3; a++) {
+        const v = this.instSphere[o + a];
+        if (v - r < box[b + a]) box[b + a] = v - r;
+        if (v + r > box[b + 3 + a]) box[b + 3 + a] = v + r;
+      }
+      if (++this.movedSinceChunks > (this._count >> 3) + 64) this.chunksStale = true;
+    }
     if (this.dirty[i] === 0) {
       this.dirty[i] = 1;
       this.dirtyList[this.dirtyCount++] = i;
@@ -504,6 +634,21 @@ export class MeshletBatch extends Object3D {
   getLevelAt(i: number): number {
     if (!(i >= 0 && i < this._count) || this.instWant[i] < 0) return -1;
     return this.groupDrawn[this.instWant[i]] - this.meshGroup[this.instMesh[i]];
+  }
+
+  /**
+   * `"lod"`: every instance is tinted by the level it is drawn at, coloured by depth in its hierarchy
+   * as `MeshletMesh` colours its levels, on both renderers. `"none"` (default): untinted. The colour
+   * multiplies the material's, as an instance colour does.
+   */
+  get debugColors(): "none" | "lod" {
+    return this._debugColors;
+  }
+  set debugColors(mode: "none" | "lod") {
+    if (mode === this._debugColors) return;
+    this._debugColors = mode;
+    if (mode !== "none") this.colorsUsed = true;
+    this.layoutStale = true;
   }
 
   /** Triangles instance `i` is drawn with. */
@@ -660,7 +805,7 @@ export class MeshletBatch extends Object3D {
 
     if (this.boundsDirty) this.computeBounds();
     if (this.cull(camera)) worked = true;
-    if (this.layoutStale && this.kind !== KIND_UNKNOWN) this.layout();
+    // (the draw lists are made when a pass is about to draw: a shadow pass, culled for its own camera, may come first)
 
     if (worked) this.stats.lastUpdateMs = performance.now() - t0;
     return changed || worked;
@@ -733,18 +878,19 @@ export class MeshletBatch extends Object3D {
         this.lastHeight = height;
       }
       if (this.layoutStale) this.layout();
-      if (this.kind === KIND_WEBGPU) this.present(!shadow && this.culledFor(camera));
+      if (this.kind === KIND_WEBGPU) this.present(shadow ? this.shadowPass(camera) : this.culledFor(camera) ? PASS_VIEW : PASS_ALL);
     };
     bm.onAfterRender = (renderer, _scene, camera, _geometry, material) => {
-      if (this.kind === KIND_WEBGL) this.drawGL(renderer as WebGLRenderer, material, this.culledFor(camera));
+      if (this.kind === KIND_WEBGL) this.drawGL(renderer as WebGLRenderer, material, this.culledFor(camera) ? PASS_VIEW : PASS_ALL);
     };
     bm.onBeforeShadow = (renderer, _object, _camera, shadowCamera) => {
       this.shadowCameras.add(shadowCamera);
       this.meet(renderer as unknown as BatchRenderer);
+      this.cullShadow(shadowCamera);
       if (this.layoutStale) this.layout();
     };
-    bm.onAfterShadow = (renderer, _object, _camera, _shadowCamera, _geometry, depthMaterial) => {
-      if (this.kind === KIND_WEBGL) this.drawGL(renderer as WebGLRenderer, depthMaterial, false);
+    bm.onAfterShadow = (renderer, _object, _camera, shadowCamera, _geometry, depthMaterial) => {
+      if (this.kind === KIND_WEBGL) this.drawGL(renderer as WebGLRenderer, depthMaterial, this.shadowPass(shadowCamera));
     };
     bm.raycast = (raycaster: Raycaster, intersects: Intersection[]) => this.raycastInstances(raycaster, intersects);
   }
@@ -819,7 +965,11 @@ export class MeshletBatch extends Object3D {
     this.instWant = grown(new Int32Array(capacity).fill(-1), this.instWant);
     this.instHidden = grown(new Uint8Array(capacity), this.instHidden);
     this.instInView = grown(new Uint8Array(capacity), this.instInView);
+    this.instInShadow = grown(new Uint8Array(capacity), this.instInShadow);
+    this.instChunk = grown(new Int32Array(capacity), this.instChunk);
     this.instDue = grown(new Float64Array(capacity), this.instDue);
+    // (the new draw object has no colours: every instance is painted again)
+    this.instTint = new Int16Array(capacity).fill(TINT_NONE);
     this.dirty = grown(new Uint8Array(capacity), this.dirty);
     this.dirtyList = grown(new Int32Array(capacity), this.dirtyList);
     this.order = new Uint32Array(capacity);
@@ -1048,28 +1198,106 @@ export class MeshletBatch extends Object3D {
     this.cullValid = true;
     this.cullStale = false;
 
+    if (this.cullInto(planes, inView)) this.layoutStale = true;
+    return true;
+  }
+
+  /**
+   * Marks every instance as inside the frustum of the shadow camera about to be drawn for, or not.
+   * A shadow pass then draws the instances in view and those (`layout`).
+   */
+  private cullShadow(shadowCamera: Camera): void {
+    const n = this._count;
+    if (n === 0) return;
+    if (!this.cullInstances || !frustumPlanesIn(shadowCamera, this.matrixWorld.elements, this.worldIdentity, _planes)) {
+      if (this.shadowValid) {
+        this.shadowValid = false;
+        this.layoutStale = true;
+      }
+      return;
+    }
+    const key = this.shadowKey;
+    const pe = shadowCamera.projectionMatrix.elements;
+    const ve = shadowCamera.matrixWorldInverse.elements;
+    const we = this.matrixWorld.elements;
+    let same = this.shadowValid && !this.shadowStale;
+    for (let j = 0; same && j < 16; j++) if (key[j] !== pe[j] || key[16 + j] !== ve[j] || key[32 + j] !== we[j]) same = false;
+    if (same) return;
+    for (let j = 0; j < 16; j++) {
+      key[j] = pe[j];
+      key[16 + j] = ve[j];
+      key[32 + j] = we[j];
+    }
+    const changed = this.cullInto(_planes, this.instInShadow);
+    if (changed || !this.shadowValid) this.layoutStale = true;
+    this.shadowValid = true;
+    this.shadowStale = false;
+  }
+
+  /** Sets `flags[i]` to whether instance `i` is inside the planes. Returns whether any flag changed. */
+  private cullInto(planes: Float64Array, flags: Uint8Array): boolean {
+    const n = this._count;
     let changed = false;
     // all of the instances at once, when the sphere around them is inside the view or outside it
-    const all = this.boundingSphere;
-    const c = all.center;
+    const whole = this.boundingSphere;
+    const c = whole.center;
     let inside = true;
     let outside = false;
     for (let o = 0; o < PLANE_FLOATS; o += 4) {
       const d = planes[o] * c.x + planes[o + 1] * c.y + planes[o + 2] * c.z + planes[o + 3];
-      if (!(d >= all.radius)) inside = false;
-      if (d < -all.radius) outside = true;
+      if (!(d >= whole.radius)) inside = false;
+      if (d < -whole.radius) outside = true;
     }
     if (inside || outside) {
       const value = inside ? 1 : 0;
       for (let i = 0; i < n; i++) {
-        if (inView[i] !== value) {
-          inView[i] = value;
+        if (flags[i] !== value) {
+          flags[i] = value;
           changed = true;
         }
       }
-    } else {
-      const s = this.instSphere;
-      for (let i = 0; i < n; i++) {
+      return changed;
+    }
+    if (this.chunksStale) this.buildChunks();
+    const s = this.instSphere;
+    const items = this.chunkItems;
+    const box = this.chunkBox;
+    for (let k = 0; k < this.chunkCount; k++) {
+      const first = k * CHUNK;
+      const last = Math.min(n, first + CHUNK);
+      // the box against each plane: its corner furthest along the plane's normal, and the nearest
+      const b = k * 6;
+      const cx = (box[b] + box[b + 3]) * 0.5;
+      const cy = (box[b + 1] + box[b + 4]) * 0.5;
+      const cz = (box[b + 2] + box[b + 5]) * 0.5;
+      const ex = (box[b + 3] - box[b]) * 0.5;
+      const ey = (box[b + 4] - box[b + 1]) * 0.5;
+      const ez = (box[b + 5] - box[b + 2]) * 0.5;
+      let side = 1; // 1 inside, 0 outside, -1 across
+      for (let o = 0; o < PLANE_FLOATS; o += 4) {
+        const nx = planes[o];
+        const ny = planes[o + 1];
+        const nz = planes[o + 2];
+        const d = nx * cx + ny * cy + nz * cz + planes[o + 3];
+        const reach = Math.abs(nx) * ex + Math.abs(ny) * ey + Math.abs(nz) * ez;
+        if (d < -reach) {
+          side = 0;
+          break;
+        }
+        if (d < reach) side = -1;
+      }
+      if (side >= 0) {
+        for (let j = first; j < last; j++) {
+          const i = items[j];
+          if (flags[i] !== side) {
+            flags[i] = side;
+            changed = true;
+          }
+        }
+        continue;
+      }
+      for (let j = first; j < last; j++) {
+        const i = items[j];
         const o = i * 4;
         const x = s[o];
         const y = s[o + 1];
@@ -1083,19 +1311,70 @@ export class MeshletBatch extends Object3D {
           planes[16] * x + planes[17] * y + planes[18] * z + planes[19] >= out
             ? 1
             : 0;
-        if (inView[i] !== value) {
-          inView[i] = value;
+        if (flags[i] !== value) {
+          flags[i] = value;
           changed = true;
         }
       }
     }
-    if (changed) this.layoutStale = true;
-    return true;
+    return changed;
+  }
+
+  /** Puts the instances in Morton order of their centres and cuts them into chunks with a box each. */
+  private buildChunks(): void {
+    this.chunksStale = false;
+    this.movedSinceChunks = 0;
+    const n = this._count;
+    if (this.boundsDirty) this.computeBounds();
+    const s = this.instSphere;
+    const c = this.boundingSphere.center;
+    const r = this.boundingSphere.radius > 0 ? this.boundingSphere.radius : 1;
+    const scale = 1023 / (2 * r);
+    // (keys: a 30 bit Morton code above the instance's number, exact in a double for up to 2^22 instances)
+    const keys = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const o = i * 4;
+      const qx = Math.max(0, Math.min(1023, Math.floor((s[o] - c.x + r) * scale)));
+      const qy = Math.max(0, Math.min(1023, Math.floor((s[o + 1] - c.y + r) * scale)));
+      const qz = Math.max(0, Math.min(1023, Math.floor((s[o + 2] - c.z + r) * scale)));
+      keys[i] = (spread10(qx) | (spread10(qy) << 1) | (spread10(qz) << 2)) * 4194304 + i;
+    }
+    keys.sort();
+    const chunks = Math.ceil(n / CHUNK);
+    if (this.chunkItems.length < this.capacity) this.chunkItems = new Int32Array(this.capacity);
+    if (this.chunkBox.length < chunks * 6) this.chunkBox = new Float32Array(Math.ceil(this.capacity / CHUNK) * 6);
+    const items = this.chunkItems;
+    const box = this.chunkBox;
+    for (let k = 0; k < chunks; k++) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let minZ = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let maxZ = -Infinity;
+      for (let j = k * CHUNK; j < Math.min(n, (k + 1) * CHUNK); j++) {
+        const i = keys[j] % 4194304;
+        items[j] = i;
+        this.instChunk[i] = k;
+        const o = i * 4;
+        const rad = s[o + 3];
+        if (s[o] - rad < minX) minX = s[o] - rad;
+        if (s[o] + rad > maxX) maxX = s[o] + rad;
+        if (s[o + 1] - rad < minY) minY = s[o + 1] - rad;
+        if (s[o + 1] + rad > maxY) maxY = s[o + 1] + rad;
+        if (s[o + 2] - rad < minZ) minZ = s[o + 2] - rad;
+        if (s[o + 2] + rad > maxZ) maxZ = s[o + 2] + rad;
+      }
+      box.set([minX, minY, minZ, maxX, maxY, maxZ], k * 6);
+    }
+    this.chunkCount = chunks;
   }
 
   /**
-   * Sorts the instances by the group they are drawn with, those in view first within each, and
-   * writes the id texture and the sub-draws of both kinds of pass.
+   * Sorts the instances by the group they are drawn with and, within each, puts first those in
+   * view, then those only in the shadow camera's view, then the rest; and writes the id texture and
+   * the sub-draws of each kind of pass (main: the first part of each group, shadow: the first two,
+   * neither culled: all of it).
    */
   private layout(): void {
     this.layoutStale = false;
@@ -1103,33 +1382,38 @@ export class MeshletBatch extends Object3D {
     const groups = this.groupTotal;
     const all = this.groupAll;
     const seen = this.groupSeen;
+    const shade = this.groupShadow;
     const base = this.groupBase;
     const want = this.instWant;
     const drawn = this.groupDrawn;
     const hidden = this.instHidden;
     const inView = this.instInView;
+    const inShadow = this.instInShadow;
     const culled = this.cullValid;
-    all.fill(0);
-    seen.fill(0);
-    for (let i = 0; i < n; i++) {
-      const w = want[i];
-      if (w < 0 || hidden[i] === 1) continue;
-      const g = drawn[w];
-      all[g]++;
-      if (!culled || inView[i] === 1) seen[g]++;
+    // (a shadow pass not culled for its camera draws everything)
+    const shadowCulled = culled && this.shadowValid;
+    // Each instance goes to a segment of its group: 0 in view, 1 only in the shadow camera's view,
+    // 2 neither. Without branches on the flags: instances come in no particular order, and a
+    // branch on whether each is in view is mispredicted half the time (it was most of the cost).
+    const view = culled ? 1 : 0;
+    const shadowing = shadowCulled ? 1 : 0;
+    const segments = this.segments;
+    segments.fill(0);
+    sortInstances(n, want, hidden, inView, inShadow, drawn, view, shadowing, segments, null);
+    for (let g = 0; g < groups; g++) {
+      seen[g] = segments[g * 3];
+      shade[g] = segments[g * 3 + 1];
+      all[g] = seen[g] + shade[g] + segments[g * 3 + 2];
     }
 
-    // the groups in use, each with a block of the id list: first its instances in view, then the rest
     const bytes = this.bytesPerIndex;
-    const webgpu = this.kind === KIND_WEBGPU;
     let D = 0;
     let at = 0;
-    let entries = 0;
-    let skipped = 0;
     let visible = 0;
     let draws = 0;
     let triangles = 0;
     let trianglesAll = 0;
+    let shadowTriangles = 0;
     for (let g = 0; g < groups; g++) {
       const count = all[g];
       if (count === 0) continue;
@@ -1140,27 +1424,12 @@ export class MeshletBatch extends Object3D {
       this.drawCounts[D] = indexCount;
       this.drawOffsets[D] = start;
       this.drawSeen[D] = seen[g];
+      this.drawShadow[D] = shadowCulled ? seen[g] + shade[g] : count;
+      shadowTriangles += (indexCount / 3) * this.drawShadow[D];
       this.drawAll[D] = count;
       this.allStarts[D] = start;
       this.allCounts[D] = indexCount;
       this.allInstances[D] = count;
-      if (webgpu) {
-        if (seen[g] > 0) {
-          if (skipped > 0) {
-            // (an empty draw: its instances are the ones this pass leaves out)
-            this.seenStarts[entries] = start;
-            this.seenCounts[entries] = 0;
-            this.seenInstances[entries] = skipped;
-            entries++;
-            skipped = 0;
-          }
-          this.seenStarts[entries] = start;
-          this.seenCounts[entries] = indexCount;
-          this.seenInstances[entries] = seen[g];
-          entries++;
-        }
-        skipped += count - seen[g];
-      }
       at += count;
       D++;
       visible += seen[g];
@@ -1169,27 +1438,25 @@ export class MeshletBatch extends Object3D {
       trianglesAll += (indexCount / 3) * count;
     }
     this.drawCount = D;
-    this.seenEntries = entries;
+    if (this.kind === KIND_WEBGPU) {
+      this.seenEntries = this.passEntries(this.drawSeen, this.seenStarts, this.seenCounts, this.seenInstances);
+      this.shadowEntries = this.passEntries(this.drawShadow, this.shadowStarts, this.shadowCounts, this.shadowInstances);
+    }
 
     const order = this.order;
-    // (groupAll and groupSeen become cursors: where the next instance in view, and the next one not, goes)
+    // (the counts become cursors: where the next instance of each segment goes)
     for (let g = 0; g < groups; g++) {
-      const count = all[g];
-      if (count === 0) continue;
-      all[g] = base[g] + seen[g];
-      seen[g] = base[g];
+      if (all[g] === 0) continue;
+      segments[g * 3] = base[g];
+      segments[g * 3 + 1] = base[g] + seen[g];
+      segments[g * 3 + 2] = base[g] + seen[g] + shade[g];
     }
-    for (let i = 0; i < n; i++) {
-      const w = want[i];
-      if (w < 0 || hidden[i] === 1) continue;
-      const g = drawn[w];
-      if (!culled || inView[i] === 1) order[seen[g]++] = i;
-      else order[all[g]++] = i;
-    }
+    sortInstances(n, want, hidden, inView, inShadow, drawn, view, shadowing, segments, order);
+    if (this.colorsUsed) this.paint();
 
     const internals = this._batched as unknown as BatchedInternals;
     const table = internals._indirectTexture.image.data;
-    if (webgpu) {
+    if (this.kind === KIND_WEBGPU) {
       table.set(order.subarray(0, at));
     } else {
       // WebGLRenderer: a sub-draw knows its number, not where its instances are in the list
@@ -1202,21 +1469,81 @@ export class MeshletBatch extends Object3D {
     this.stats.draws = draws;
     this.stats.triangles = triangles;
     this.stats.trianglesAll = trianglesAll;
+    this.shadowTriangles = shadowTriangles;
+  }
+
+  /**
+   * WebGPURenderer: the sub-draws of a pass that draws the first `drawn[d]` instances of each
+   * sub-draw's block. Its instances are numbered on from draw to draw, so the ones a pass leaves
+   * out are stepped over with an empty draw. Returns how many entries were written.
+   */
+  private passEntries(drawn: Int32Array, starts: Int32Array, counts: Int32Array, instances: Int32Array): number {
+    let entries = 0;
+    let skipped = 0;
+    for (let d = 0; d < this.drawCount; d++) {
+      const k = drawn[d];
+      if (k > 0) {
+        if (skipped > 0) {
+          starts[entries] = this.drawOffsets[d];
+          counts[entries] = 0;
+          instances[entries] = skipped;
+          entries++;
+          skipped = 0;
+        }
+        starts[entries] = this.drawOffsets[d];
+        counts[entries] = this.drawCounts[d];
+        instances[entries] = k;
+        entries++;
+      }
+      skipped += this.drawAll[d] - k;
+    }
+    return entries;
+  }
+
+  /** Gives every instance whose tint is not what `debugColors` asks for its colour in the draw object. */
+  private paint(): void {
+    const bm = this._batched;
+    const lod = this._debugColors === "lod";
+    const tint = this.instTint;
+    const want = this.instWant;
+    const fresh = (bm as unknown as { _colorsTexture: unknown })._colorsTexture === null;
+    let painted = false;
+    for (let i = 0; i < this._count; i++) {
+      let t = TINT_WHITE;
+      if (lod && want[i] >= 0) {
+        const mesh = this.instMesh[i];
+        const levels = this.levels[mesh];
+        t = levels.depth[this.groupDrawn[want[i]] - this.meshGroup[mesh]] % LOD_PALETTE.length;
+      }
+      if (tint[i] === t) continue;
+      tint[i] = t;
+      bm.setColorAt(i, t === TINT_WHITE ? _white : LOD_PALETTE[t]);
+      painted = true;
+    }
+    // (WebGLRenderer before r181 looks for the colours under this name, see createBatched)
+    if (painted) (bm as unknown as { colorTexture: unknown }).colorTexture = (bm as unknown as { _colorsTexture: unknown })._colorsTexture;
+    // WebGPURenderer looks at what a draw object has (a colour texture now) only when its material changes
+    if (fresh && painted) (bm.material as Material).needsUpdate = true;
   }
 
   /** WebGPURenderer: hands the draw object the sub-draws of the pass about to be drawn. */
-  private present(culled: boolean): void {
+  private present(pass: number): void {
     const internals = this._batched as unknown as BatchedInternals;
     if (THREE_REVISION < WEBGPU_MERGED_REVISION) {
       internals._mergedDrawCount = 0;
       return;
     }
     internals._multiDrawBytesPerElement = this.bytesPerIndex; // (the starts are in bytes, as three keeps them)
-    if (culled) {
+    if (pass === PASS_VIEW) {
       internals._mergedDrawStarts = this.seenStarts;
       internals._mergedDrawCounts = this.seenCounts;
       internals._mergedDrawInstanceCounts = this.seenInstances;
       internals._mergedDrawCount = this.seenEntries;
+    } else if (pass === PASS_SHADOW) {
+      internals._mergedDrawStarts = this.shadowStarts;
+      internals._mergedDrawCounts = this.shadowCounts;
+      internals._mergedDrawInstanceCounts = this.shadowInstances;
+      internals._mergedDrawCount = this.shadowEntries;
     } else {
       internals._mergedDrawStarts = this.allStarts;
       internals._mergedDrawCounts = this.allCounts;
@@ -1229,10 +1556,10 @@ export class MeshletBatch extends Object3D {
    * WebGLRenderer: the draw call. three has just drawn the (empty) BatchedMesh, so its program,
    * its textures and its vertex array are bound.
    */
-  private drawGL(renderer: WebGLRenderer, material: Material, culled: boolean): void {
+  private drawGL(renderer: WebGLRenderer, material: Material, pass: number): void {
     const D = this.drawCount;
     if (D === 0) return;
-    const instances = culled ? this.drawSeen : this.drawAll;
+    const instances = pass === PASS_VIEW ? this.drawSeen : pass === PASS_SHADOW ? this.drawShadow : this.drawAll;
     const gl = renderer.getContext() as WebGL2RenderingContext;
     const type = this.bytesPerIndex === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
     const extension = renderer.extensions.get("WEBGL_multi_draw") as WEBGL_multi_draw | null;
@@ -1251,7 +1578,17 @@ export class MeshletBatch extends Object3D {
     }
     const info = renderer.info.render;
     info.calls++;
-    info.triangles += culled ? this.stats.triangles : this.stats.trianglesAll;
+    info.triangles += pass === PASS_VIEW ? this.stats.triangles : pass === PASS_SHADOW ? this.shadowTriangles : this.stats.trianglesAll;
+  }
+
+  /** The kind of pass a shadow pass for `shadowCamera` is: culled for it if the batch was last culled for it. */
+  private shadowPass(shadowCamera: Camera): number {
+    if (!this.cullValid || !this.shadowValid) return PASS_ALL;
+    const key = this.shadowKey;
+    const p = shadowCamera.projectionMatrix.elements;
+    const v = shadowCamera.matrixWorldInverse.elements;
+    for (let j = 0; j < 16; j++) if (key[j] !== p[j] || key[16 + j] !== v[j]) return PASS_ALL;
+    return PASS_SHADOW;
   }
 
   // =========================================================================

@@ -20,6 +20,7 @@ import { computeDrawRanges, rangesOfCut } from "../core/ranges.js";
 import type { DrawRanges } from "../core/ranges.js";
 import { ClusterSelector, lodScale } from "../core/select.js";
 import { frustumPlanesIn, PLANE_FLOATS } from "./viewPlanes.js";
+import { LOD_PALETTE } from "./palette.js";
 import type { MeshletData, TypedArray } from "../types.js";
 
 /** How drawn clusters are tinted. */
@@ -176,11 +177,6 @@ const _range = {
   start: 0,
   count: 0,
 };
-
-/** Palette for `debugColors = "lod"`, indexed by group depth. */
-const LOD_PALETTE: readonly Color[] = [
-  0x4e79a7, 0xf28e2b, 0xe15759, 0x76b7b2, 0x59a14f, 0xedc948, 0xb07aa1, 0xff9da7, 0x9c755f, 0xbab0ac,
-].map((hex) => new Color(hex));
 
 function hash32(n: number): number {
   n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
@@ -1882,8 +1878,12 @@ export class MeshletMesh extends Object3D {
       default:
         _color.setRGB(this.colors[i * 3], this.colors[i * 3 + 1], this.colors[i * 3 + 2]);
     }
+    const bm = this._batched as unknown as { colorTexture: unknown; _colorsTexture: unknown; material: Material };
+    const fresh = bm._colorsTexture === null;
     this._batched.setColorAt(slot, _color);
-    (this._batched as unknown as { colorTexture: unknown; _colorsTexture: unknown }).colorTexture = (this._batched as unknown as { _colorsTexture: unknown })._colorsTexture;
+    bm.colorTexture = bm._colorsTexture;
+    // WebGPURenderer looks at what a draw object has (a colour texture now) only when its material changes
+    if (fresh) bm.material.needsUpdate = true;
   }
 
   /** Color of instance `i` when it is drawn at a whole-mesh level (`"cluster"` colours are not drawn by level). */

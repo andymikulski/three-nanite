@@ -47,6 +47,8 @@ describe("colorMapFromMaterial", () => {
     const direct = await buildMeshlets(roof.input, {
       ...options,
       colorMap: { ...cm, flipY: false, repeat: [1, 1], offset: [0, 0], alphaTest: 0 },
+      // (what an opaque material also sets: see BuildFromGeometryOptions.material)
+      dilateBorders: true,
     });
     const plain = await buildMeshletsFromGeometry(geometry, options);
     expect(Array.from(viaMaterial.indices)).toEqual(Array.from(direct.indices));

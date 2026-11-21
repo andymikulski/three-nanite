@@ -28,8 +28,21 @@ export interface BuildFromGeometryOptions extends BuildMeshletsOptions {
    * any model that gets its colours from a palette or an atlas. Ignored where `colorMap` or
    * `vertexColors` is given, and where the texture's pixels cannot be read (see
    * `colorMapFromMaterial`).
+   *
+   * It also sets `dilateBorders` where that is not given: on for an opaque material, and for a
+   * cut-out whose map keeps its coverage when minified (one made by `prepareCutoutTexture`); off
+   * for a plain `alphaTest` cut-out and a transparent material, whose full-detail look thins out
+   * with distance anyway.
    */
-  material?: { map?: unknown; alphaTest?: number; vertexColors?: boolean } | null;
+  material?: { map?: unknown; alphaTest?: number; transparent?: boolean; vertexColors?: boolean } | null;
+}
+
+/** Whether what a material draws keeps its coverage with distance (see `BuildFromGeometryOptions.material`). */
+function keepsCoverage(material: NonNullable<BuildFromGeometryOptions["material"]>): boolean {
+  const map = material.map as { userData?: { keepsCoverage?: boolean } } | null | undefined;
+  if (material.transparent === true) return false;
+  if ((material.alphaTest ?? 0) > 0) return map?.userData?.keepsCoverage === true;
+  return true;
 }
 
 /**
@@ -44,6 +57,7 @@ export function buildMeshletsFromGeometry(
   options: BuildFromGeometryOptions = {},
 ): Promise<MeshletData> {
   const { attributes, material, ...buildOptions } = options;
+  if (material && buildOptions.dilateBorders === undefined) buildOptions.dilateBorders = keepsCoverage(material);
   if (material && buildOptions.colorMap === undefined && buildOptions.vertexColors === undefined) {
     const colorMap = colorMapFromMaterial(material as Parameters<typeof colorMapFromMaterial>[0]);
     if (colorMap) buildOptions.colorMap = colorMap;
