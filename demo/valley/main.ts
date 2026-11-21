@@ -17,7 +17,7 @@ import {
   SRGBColorSpace,
   Vector3,
 } from "three";
-import type { Material, Matrix4, WebGLRenderer } from "three";
+import type { Material, Matrix4 } from "three";
 import GUI from "lil-gui";
 import { MeshletBatch, MeshletMesh } from "../../src/index.js";
 import type { MeshletData } from "../../src/index.js";
@@ -302,7 +302,7 @@ function buildImpostorField(): Promise<void> {
     await say("baking impostors");
     let field: ImpostorField;
     try {
-      field = await buildImpostors(renderer as WebGLRenderer, [...models.values()], materials as Map<string, Material>, placements, say);
+      field = await buildImpostors(renderer, [...models.values()], materials as Map<string, Material>, placements, say);
     } catch (error) {
       // back to three-nanite, with what went wrong in the readout
       note = "impostors: " + (error instanceof Error ? error.message : String(error));
@@ -364,11 +364,6 @@ function whiteVersion(material: MeshStandardMaterial): MeshStandardMaterial {
 }
 
 function applySettings(): void {
-  if (settings.draw === "impostors" && (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true) {
-    // (three-impostor is for WebGLRenderer only)
-    settings.draw = "nanite";
-    note = "impostors need the WebGL renderer";
-  }
   const nanite = settings.draw === "nanite";
   if (settings.draw === "instanced") buildInstanced();
   if (settings.draw === "impostors") void buildImpostorField();
@@ -409,7 +404,7 @@ else controls.mode = settings.camera;
 
 const gui = new GUI({ title: "three-nanite · the valley" });
 gui
-  .add(settings, "draw", { "three-nanite (MeshletBatch)": "nanite", "plain InstancedMesh, full detail": "instanced", "impostors (three-impostor, WebGL)": "impostors" })
+  .add(settings, "draw", { "three-nanite (MeshletBatch)": "nanite", "plain InstancedMesh, full detail": "instanced", "impostors (three-impostor)": "impostors" })
   .name("draw as")
   .listen()
   .onChange(applySettings);

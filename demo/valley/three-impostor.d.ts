@@ -1,4 +1,4 @@
-// The part of @octa-lab/three-impostor (~/dev/three-impostor, aliased in vite.config.ts) the valley
+// The part of @octa-lab/three-impostor (and of its /webgpu entry, the same API for WebGPURenderer) (~/dev/three-impostor, aliased in vite.config.ts) the valley
 // uses. Declared here rather than type-checked from its sources, which are written against three
 // r180's types and their own compiler settings.
 declare module "@octa-lab/three-impostor" {
@@ -26,5 +26,17 @@ declare module "@octa-lab/three-impostor" {
       onProgress?: (progress: { fraction: number }) => void;
       maxMemoryMB?: number;
     },
+  ): Promise<ImpostorAtlas>;
+}
+
+declare module "@octa-lab/three-impostor/webgpu" {
+  import type { Object3D } from "three";
+  import type { WebGPURenderer } from "three/webgpu";
+  import type { ImpostorAtlas } from "@octa-lab/three-impostor";
+
+  export function bakeImpostorSet(
+    renderer: WebGPURenderer,
+    sources: Array<Object3D | { source: Object3D; options?: Record<string, unknown> }>,
+    options?: Parameters<typeof import("@octa-lab/three-impostor").bakeImpostorSet>[2],
   ): Promise<ImpostorAtlas>;
 }

@@ -72,7 +72,11 @@ function valleySlash(): Plugin {
 export default defineConfig({
   plugins: [mount("/nature/", NATURE_KIT), valleySlash()],
   resolve: {
-    alias: { "@octa-lab/three-impostor": IMPOSTOR_LIB + "/src/index.ts" },
+    alias: [
+      // (exact matches: the WebGL entry and the WebGPURenderer one)
+      { find: /^@octa-lab\/three-impostor\/webgpu$/, replacement: IMPOSTOR_LIB + "/src/webgpu/index.ts" },
+      { find: /^@octa-lab\/three-impostor$/, replacement: IMPOSTOR_LIB + "/src/index.ts" },
+    ],
     // (its sources would otherwise find the three in their own folder: one three for everything)
     dedupe: ["three"],
   },
